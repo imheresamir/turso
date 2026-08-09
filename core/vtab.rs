@@ -32,6 +32,10 @@ pub struct VirtualTable {
 }
 
 impl VirtualTable {
+    pub fn columns(&self) -> &[Column] {
+        &self.columns
+    }
+
     pub(crate) fn id(&self) -> u64 {
         self.vtab_id
     }

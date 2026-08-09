@@ -3,6 +3,7 @@ mod catalog;
 mod copy;
 mod functions;
 mod session;
+mod srf;
 
 pub use session::PgConnection as Connection;
 pub use session::{

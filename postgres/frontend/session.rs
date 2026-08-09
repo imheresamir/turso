@@ -227,7 +227,7 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
     crate::srf::rewrite_stmt(&pg_conn.conn, &mut stmt);
     pg_conn
         .conn
-        .prepare_translated_cmd_with_options(translated.cmd, sql, &options)
+        .prepare_translated_stmt_with_options(stmt, sql, &options)
 }
 
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
