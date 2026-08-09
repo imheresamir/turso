@@ -244,9 +244,11 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         stmt.run_ignore_rows()?;
     }
 
+    let mut stmt = translated.stmt;
+    crate::srf::rewrite_stmt(&pg_conn.conn, &mut stmt);
     pg_conn
         .conn
-        .prepare_translated_stmt_with_options(translated.stmt, sql, &options)
+        .prepare_translated_stmt_with_options(stmt, sql, &options)
 }
 
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
