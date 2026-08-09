@@ -498,6 +498,9 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
         Type::FLOAT8 if bytes.len() == 8 => {
             return Ok(Value::from_f64(f64::from_be_bytes(bytes.try_into().unwrap())));
         }
+        Type::BOOL if bytes.len() == 1 => {
+            return Ok(Value::from_i64(bytes[0] as i64));
+        }
         _ => {}
     }
 
@@ -589,10 +592,17 @@ fn encode_value(
             .encode_field(&None::<i8>)
             .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
         Value::Numeric(turso_core::Numeric::Integer(i)) => {
-            // Boolean columns: encode as true/false instead of 0/1
             if *pg_type == Type::BOOL {
                 encoder
                     .encode_field(&(*i != 0))
+                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+            } else if *pg_type == Type::INT4 {
+                encoder
+                    .encode_field(&(*i as i32))
+                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+            } else if *pg_type == Type::INT2 {
+                encoder
+                    .encode_field(&(*i as i16))
                     .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
             } else {
                 encoder

@@ -4661,6 +4661,104 @@ pub fn is_comment_on(parse_result: &ParseResult) -> bool {
     matches!(&nodes[0].0, NodeRef::CommentStmt(_))
 }
 
+#[derive(Debug, Clone)]
+pub struct PgPrepareStmt {
+    pub name: String,
+    pub query: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PgExecuteStmt {
+    pub name: String,
+    pub params: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PgDeallocateStmt {
+    pub name: Option<String>,
+}
+
+pub fn try_extract_prepare(parse_result: &ParseResult) -> Option<PgPrepareStmt> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return None;
+    }
+    let prepare = match &nodes[0].0 {
+        NodeRef::PrepareStmt(p) => p,
+        _ => return None,
+    };
+    let query = prepare.query.as_ref()?.deparse().ok()?;
+    Some(PgPrepareStmt {
+        name: prepare.name.clone(),
+        query,
+    })
+}
+
+fn node_to_literal_string(node: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::protobuf::{a_const::Val, node::Node};
+    match &node.node {
+        Some(Node::Integer(i)) => Some(i.ival.to_string()),
+        Some(Node::Float(f)) => Some(f.fval.clone()),
+        Some(Node::String(s)) => Some(format!("'{}'", s.sval.replace('\'', "''"))),
+        Some(Node::AConst(a)) => {
+            if a.isnull {
+                return Some("NULL".to_string());
+            }
+            match a.val.as_ref()? {
+                Val::Ival(i) => Some(i.ival.to_string()),
+                Val::Fval(f) => Some(f.fval.clone()),
+                Val::Sval(s) => Some(format!("'{}'", s.sval.replace('\'', "''"))),
+                Val::Boolval(b) => Some(if b.boolval { "true".to_string() } else { "false".to_string() }),
+                Val::Bsval(_) => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+pub fn try_extract_execute(parse_result: &ParseResult) -> Option<PgExecuteStmt> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return None;
+    }
+    let execute = match &nodes[0].0 {
+        NodeRef::ExecuteStmt(e) => e,
+        _ => return None,
+    };
+    let params = execute
+        .params
+        .iter()
+        .filter_map(node_to_literal_string)
+        .collect();
+    Some(PgExecuteStmt {
+        name: execute.name.clone(),
+        params,
+    })
+}
+
+pub fn try_extract_deallocate(parse_result: &ParseResult) -> Option<PgDeallocateStmt> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return None;
+    }
+    let deallocate = match &nodes[0].0 {
+        NodeRef::DeallocateStmt(d) => d,
+        _ => return None,
+    };
+    let name = if deallocate.isall {
+        None
+    } else {
+        Some(deallocate.name.clone())
+    };
+    Some(PgDeallocateStmt { name })
+}
+
 /// Extracted COPY FROM statement info for use by the connection layer.
 #[derive(Debug, Clone)]
 pub struct PgCopyFromStmt {

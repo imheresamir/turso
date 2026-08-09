@@ -243,6 +243,19 @@ fn infer_expression_primitive(
             ),
         },
         Expr::RowId { .. } => Some("INTEGER"),
+        Expr::FunctionCall { name, .. } | Expr::FunctionCallStar { name, .. } => {
+            match name.as_str().to_ascii_uppercase().as_str() {
+                "COUNT" => Some("INT8"),
+                "SUM" | "TOTAL" => Some("INT8"),
+                "AVG" | "ROUND" | "MIN" | "MAX" => Some("REAL"),
+                "LENGTH" | "ABS" | "RANDOM" => Some("INTEGER"),
+                _ => affinity_to_primitive(translate::expr::get_expr_affinity(
+                    expr,
+                    referenced_tables,
+                    None,
+                )),
+            }
+        }
         // CAST, column references, and anything else: defer to the affinity
         // machinery, which handles these shapes correctly.
         _ => affinity_to_primitive(translate::expr::get_expr_affinity(
