@@ -3,6 +3,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
 };
+use std::collections::HashMap;
 
 use async_trait::async_trait;
 use futures::stream;
@@ -101,13 +102,36 @@ impl TursoPgServer {
     }
 }
 
-struct TursoPgHandler {
+pub struct TursoPgHandler {
     conn: Arc<Mutex<PgConnection>>,
     db_file: String,
     query_parser: Arc<NoopQueryParser>,
 }
 
 impl TursoPgHandler {
+    pub fn new(conn: Arc<Mutex<PgConnection>>, db_file: String) -> Self {
+        Self {
+            conn,
+            db_file,
+            query_parser: Arc::new(NoopQueryParser::new()),
+        }
+    }
+
+    fn infer_param_types(&self, conn: &PgConnection, query: &str) -> Vec<Type> {
+        let count = conn.prepare(query).map(|s| s.parameters_count()).unwrap_or(0);
+        if count == 0 {
+            return Vec::new();
+        }
+        let table = first_table_name(query);
+        let cols: Option<HashMap<String, Type>> =
+            table.as_deref().and_then(|t| table_column_types(conn, t));
+        let mut out = Vec::with_capacity(count);
+        for i in 1..=count {
+            out.push(param_type_for(query, i, &cols));
+        }
+        out
+    }
+
     /// After a DROP SCHEMA query succeeds, delete the schema's database file.
     /// Uses simple string matching to detect DROP SCHEMA statements.
     fn cleanup_dropped_schema_file(&self, query: &str) {
@@ -232,8 +256,10 @@ impl ExtendedQueryHandler for TursoPgHandler {
         // Clean up schema file after successful DROP SCHEMA
         self.cleanup_dropped_schema_file(query);
 
+        let param_types = self.infer_param_types(&conn, query);
+
         // Bind parameters from the portal
-        bind_portal_parameters(&mut stmt, portal)?;
+        bind_portal_parameters(&mut stmt, portal, &param_types)?;
 
         if stmt.num_columns() == 0 || is_pg_non_query(query) {
             return execute_non_query(&mut stmt, query);
@@ -256,11 +282,16 @@ impl ExtendedQueryHandler for TursoPgHandler {
             .prepare(&target.statement)
             .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
 
-        let param_types: Vec<Type> = target
-            .parameter_types
-            .iter()
-            .map(|t| t.clone().unwrap_or(Type::TEXT))
-            .collect();
+        let resolved = self.infer_param_types(&conn, &target.statement);
+        let param_types: Vec<Type> = if resolved.is_empty() {
+            target
+                .parameter_types
+                .iter()
+                .map(|t| t.clone().unwrap_or(Type::TEXT))
+                .collect()
+        } else {
+            resolved
+        };
 
         let fields = build_field_info(&stmt, &Format::UnifiedText);
         Ok(DescribeStatementResponse::new(param_types, fields))
@@ -426,17 +457,13 @@ fn execute_non_query(stmt: &mut turso_core::Statement, query: &str) -> PgWireRes
 fn bind_portal_parameters(
     stmt: &mut turso_core::Statement,
     portal: &Portal<String>,
+    param_types: &[Type],
 ) -> PgWireResult<()> {
     for i in 0..portal.parameter_len() {
         let value = match &portal.parameters[i] {
             None => Value::Null,
             Some(bytes) => {
-                let pg_type = portal
-                    .statement
-                    .parameter_types
-                    .get(i)
-                    .and_then(|t| t.as_ref())
-                    .unwrap_or(&Type::UNKNOWN);
+                let pg_type = param_types.get(i).unwrap_or(&Type::UNKNOWN);
                 pg_bytes_to_value(bytes, pg_type)?
             }
         };
@@ -454,9 +481,26 @@ fn bind_portal_parameters(
     Ok(())
 }
 
-/// Convert raw parameter bytes to a turso Value based on the PostgreSQL type.
-/// Assumes text format encoding (UTF-8 string representations).
 fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
+    match *pg_type {
+        Type::INT2 if bytes.len() == 2 => {
+            return Ok(Value::from_i64(i16::from_be_bytes(bytes.try_into().unwrap()) as i64));
+        }
+        Type::INT4 if bytes.len() == 4 => {
+            return Ok(Value::from_i64(i32::from_be_bytes(bytes.try_into().unwrap()) as i64));
+        }
+        Type::INT8 if bytes.len() == 8 => {
+            return Ok(Value::from_i64(i64::from_be_bytes(bytes.try_into().unwrap())));
+        }
+        Type::FLOAT4 if bytes.len() == 4 => {
+            return Ok(Value::from_f64(f32::from_be_bytes(bytes.try_into().unwrap()) as f64));
+        }
+        Type::FLOAT8 if bytes.len() == 8 => {
+            return Ok(Value::from_f64(f64::from_be_bytes(bytes.try_into().unwrap())));
+        }
+        _ => {}
+    }
+
     let text = std::str::from_utf8(bytes).map_err(|e| {
         PgWireError::UserError(Box::new(error_info(&format!(
             "invalid UTF-8 in parameter: {e}"
@@ -753,6 +797,117 @@ fn is_create_table_as(upper: &str) -> bool {
         return false;
     }
     matches!(tokens.next(), Some(t) if t == "AS" || t.starts_with("AS("))
+}
+
+fn first_table_name(sql: &str) -> Option<String> {
+    let upper = sql.to_uppercase();
+    for kw in ["INSERT INTO", "UPDATE", "FROM", "JOIN"] {
+        if let Some(pos) = upper.find(kw) {
+            let rest = &sql[pos + kw.len()..];
+            let rest_u = &upper[pos + kw.len()..];
+            let mut start = None;
+            for (idx, c) in rest.char_indices() {
+                if c.is_whitespace() {
+                    continue;
+                }
+                if c == '(' {
+                    break;
+                }
+                start = Some(idx);
+                break;
+            }
+            if let Some(s) = start {
+                let tail = &rest_u[s..];
+                let name = tail
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim_matches('"')
+                    .trim_end_matches(';');
+                let name = name.split(['(', ' ']).next().unwrap_or(name);
+                let name = name.split('.').last().unwrap_or(name);
+                let name = name.trim_matches('"');
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn table_column_types(conn: &PgConnection, table: &str) -> Option<HashMap<String, Type>> {
+    let core = conn.inner();
+    let sql = format!("PRAGMA table_info('{table}')");
+    let mut stmt = core.prepare_internal(&sql).ok()?;
+    let rows = stmt.run_collect_rows().ok()?;
+    let mut map = HashMap::new();
+    for row in rows {
+        if let Some(turso_core::Value::Text(name)) = row.get(1) {
+            let col = name.as_str().to_string();
+            let ty = match row.get(2) {
+                Some(turso_core::Value::Text(decl)) => sqlite_type_to_pg_type(decl.as_str()),
+                _ => Type::TEXT,
+            };
+            map.insert(col, ty);
+        }
+    }
+    Some(map)
+}
+
+fn param_type_for(
+    sql: &str,
+    i: usize,
+    cols: &Option<HashMap<String, Type>>,
+) -> Type {
+    let param = format!("${i}");
+    if let Some(ty) = insert_value_type(sql, i, cols) {
+        return ty;
+    }
+    let tokens: Vec<&str> = sql.split_whitespace().collect();
+    for w in 0..tokens.len() {
+        if tokens[w] == param {
+            for offset in [1usize, 2] {
+                for neighbour in [w.wrapping_sub(offset), w + offset] {
+                    if neighbour < tokens.len() {
+                        let cand = tokens[neighbour].trim_matches(['"', '(', ')', ',', ';', '=']);
+                        if cand.is_empty() || cand == "=" {
+                            continue;
+                        }
+                        if let Some(map) = cols {
+                            if let Some(ty) = map.get(cand) {
+                                return ty.clone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Type::TEXT
+}
+
+fn insert_value_type(
+    sql: &str,
+    i: usize,
+    cols: &Option<HashMap<String, Type>>,
+) -> Option<Type> {
+    let upper = sql.to_uppercase();
+    let values_pos = upper.find("VALUES")?;
+    let head = &sql[..values_pos];
+    let open = head.rfind('(')?;
+    let close = head[open..].find(')').map(|p| open + p)?;
+    let col_list = &sql[open + 1..close];
+    let columns: Vec<&str> = col_list
+        .split(',')
+        .map(|c| c.trim().trim_matches('"'))
+        .filter(|c| !c.is_empty())
+        .collect();
+    let col = columns.get(i - 1)?;
+    if let Some(map) = cols {
+        return map.get(*col).cloned();
+    }
+    None
 }
 
 fn error_info(message: &str) -> ErrorInfo {
