@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::num::NonZero;
+use std::path::PathBuf;
 use std::str;
 use std::sync::{Arc, Mutex};
 
 use crate::aliases;
 use crate::catalog::{self, PostgresDialect};
-use turso_core::{CheckpointMode, Connection, LimboError, PrepareOptions, Result, Statement, Value};
+use turso_core::{CheckpointMode, Connection, IOResult, LimboError, PrepareOptions, Result, Statement, Value};
+use turso_core::return_if_io;
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
     is_comment_on, is_refresh_matview, try_extract_copy_from, try_extract_create_schema,
@@ -31,11 +33,50 @@ impl PgConnection {
             })
             .map(|_| ())
     }
+    pub fn checkpoint_schemas(&self) -> Result<()> {
+        self.inner
+            .conn
+            .checkpoint_attached(CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            })
+            .map(|_| ())
+    }
+    pub fn set_schema_dir(&self, dir: PathBuf) {
+        *self.inner.schema_dir.lock().unwrap() = Some(dir);
+    }
+    pub fn set_schema_storage_factory(
+        &self,
+        f: Arc<
+            dyn Fn(&str, &std::path::Path) -> Result<Arc<dyn turso_core::storage::database::DatabaseStorage>>
+                + Send
+                + Sync,
+        >,
+    ) {
+        *self.inner.schema_storage_factory.lock().unwrap() = Some(f);
+    }
+    pub fn set_schema_drop(&self, f: Arc<dyn Fn(&str) + Send + Sync>) {
+        *self.inner.schema_drop.lock().unwrap() = Some(f);
+    }
 }
 
 struct PgConnectionInner {
-    conn: Arc<Connection>,
+    conn:          Arc<Connection>,
     session_state: Mutex<SessionState>,
+    schema_dir:    Mutex<Option<PathBuf>>,
+    schema_storage_factory: Mutex<
+        Option<
+            Arc<
+                dyn Fn(
+                    &str,
+                    &std::path::Path,
+                )
+                    -> Result<Arc<dyn turso_core::storage::database::DatabaseStorage>>
+                    + Send
+                    + Sync,
+            >,
+        >,
+    >,
+    schema_drop: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>,
 }
 
 impl PgConnectionInner {
@@ -120,6 +161,9 @@ impl PgConnection {
             inner: Arc::new(PgConnectionInner {
                 conn,
                 session_state: Mutex::new(SessionState::default()),
+                schema_dir: Mutex::new(None),
+                schema_storage_factory: Mutex::new(None),
+                schema_drop: Mutex::new(None),
             }),
         }
     }
@@ -307,12 +351,12 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
     }
 
     if let Some(stmt) = try_extract_create_schema(&parse_result) {
-        handle_pg_create_schema(&pg_conn.conn, &stmt)?;
+        handle_pg_create_schema(pg_conn, &stmt)?;
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
     if let Some(stmt) = try_extract_drop_schema(&parse_result) {
-        handle_pg_drop_schema(&pg_conn.conn, &stmt)?;
+        handle_pg_drop_schema(pg_conn, &stmt)?;
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
@@ -484,7 +528,7 @@ fn literal_to_value(raw: &str) -> Value {
     Value::Text(trimmed.to_string().into())
 }
 
-fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) -> Result<()> {
+fn handle_pg_create_schema(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCreateSchemaStmt) -> Result<()> {
     let name = stmt.name.to_lowercase();
     if name == "public" {
         if stmt.if_not_exists {
@@ -495,7 +539,7 @@ fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) ->
         )));
     }
 
-    if schema_exists(conn, &name)? {
+    if schema_exists(&pg_conn.conn, &name)? {
         if stmt.if_not_exists {
             return Ok(());
         }
@@ -504,17 +548,26 @@ fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) ->
         )));
     }
 
-    let path = schema_file_path(conn, &name);
+    let path = schema_file_path(pg_conn, &name);
+    if let Some(factory) = &*pg_conn.schema_storage_factory.lock().unwrap() {
+        let path_ref: &std::path::Path = std::path::Path::new(&path);
+        let storage = factory(&name, path_ref)?;
+        pg_conn.conn.attach_database_with_storage(&path, &name, storage)?;
+        return Ok(());
+    }
     execute_sqlite_internal(
-        conn,
+        &pg_conn.conn,
         format!("ATTACH '{}' AS \"{}\"", path.replace('\'', "''"), name),
     )?;
     Ok(())
 }
 
-fn schema_file_path(conn: &Connection, schema_name: &str) -> String {
-    let main_path = conn.db_file_path();
+fn schema_file_path(pg_conn: &Arc<PgConnectionInner>, schema_name: &str) -> String {
     let filename = format!("turso-postgres-schema-{schema_name}.db");
+    if let Some(dir) = &*pg_conn.schema_dir.lock().unwrap() {
+        return dir.join(&filename).to_string_lossy().to_string();
+    }
+    let main_path = pg_conn.conn.db_file_path();
     if main_path == ":memory:" {
         filename
     } else {
@@ -525,13 +578,13 @@ fn schema_file_path(conn: &Connection, schema_name: &str) -> String {
     }
 }
 
-fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Result<()> {
+fn handle_pg_drop_schema(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropSchemaStmt) -> Result<()> {
     let name = stmt.name.to_lowercase();
     if name == "public" {
-        return handle_pg_drop_schema_public(conn, stmt.cascade);
+        return handle_pg_drop_schema_public(&pg_conn.conn, stmt.cascade);
     }
 
-    if !schema_exists(conn, &name)? {
+    if !schema_exists(&pg_conn.conn, &name)? {
         if stmt.if_exists {
             return Ok(());
         }
@@ -541,10 +594,13 @@ fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Res
     }
 
     if stmt.cascade {
-        drop_all_tables_in_schema(conn, &name)?;
+        drop_all_tables_in_schema(&pg_conn.conn, &name)?;
     }
 
-    execute_sqlite_internal(conn, format!("DETACH \"{name}\""))?;
+    execute_sqlite_internal(&pg_conn.conn, format!("DETACH \"{name}\""))?;
+    if let Some(drop) = &*pg_conn.schema_drop.lock().unwrap() {
+        drop(&name);
+    }
     Ok(())
 }
 

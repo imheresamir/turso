@@ -1865,6 +1865,7 @@ impl Connection {
         main_db_flags: OpenFlags,
         io: Arc<dyn IO>,
         dialect: Arc<dyn crate::Dialect>,
+        storage: Option<Arc<dyn crate::storage::database::DatabaseStorage>>,
     ) -> Result<(Arc<Database>, Option<EncryptionOpts>)> {
         let opts = OpenOptions::parse(uri)?;
         let mut flags = opts.get_flags()?;
@@ -1889,14 +1890,22 @@ impl Connection {
             db_opts = db_opts.with_encryption(true);
         }
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
-        let db = Database::open_file_with_flags(
-            io.clone(),
-            &opts.path,
-            flags,
-            db_opts,
-            encryption_opts.clone(),
-            dialect,
-        )?;
+        let db = if let Some(storage) = storage {
+            let options = crate::database::OpenOptions::new(dialect.clone())
+                .storage(storage)
+                .flags(flags)
+                .db_opts(db_opts);
+            Database::open(io.clone(), &opts.path, options)?
+        } else {
+            Database::open_file_with_flags(
+                io.clone(),
+                &opts.path,
+                flags,
+                db_opts,
+                encryption_opts.clone(),
+                dialect,
+            )?
+        };
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;
             std::fs::set_permissions(&opts.path, perms.permissions())
@@ -2357,6 +2366,16 @@ impl Connection {
     }
 
     /// Close a connection and checkpoint.
+    pub fn checkpoint_attached(&self, mode: CheckpointMode) -> Result<()> {
+        if self.is_closed() {
+            return Err(LimboError::InternalError("Connection closed".to_string()));
+        }
+        let attached = self.attached_databases.read();
+        for (_idx, (_db, pager)) in attached.index_to_data.iter() {
+            pager.blocking_checkpoint(mode, self.get_sync_mode())?;
+        }
+        Ok(())
+    }
     pub fn close(&self) -> Result<()> {
         if self.is_closed() {
             return Ok(());
@@ -3394,10 +3413,25 @@ impl Connection {
         alias: &str,
         state: &mut AttachDatabaseState,
     ) -> Result<IOResult<()>> {
-        self.attach_database_with_config(path, alias, None, state)
+        self.attach_database_with_config(path, alias, None, state, None)
     }
 
     /// Attach a database file with an optional pre-initialization reserved-space override.
+    #[cfg(feature = "fs")]
+    pub fn attach_database_with_storage(
+        &self,
+        path: &str,
+        alias: &str,
+        storage: Arc<dyn crate::storage::database::DatabaseStorage>,
+    ) -> Result<IOResult<()>> {
+        let mut state = AttachDatabaseState::Start;
+        loop {
+            match self.attach_database_with_config(path, alias, None, &mut state, Some(storage.clone()))? {
+                IOResult::Done(()) => return Ok(IOResult::Done(())),
+                IOResult::IO(io) => io.wait(self.db.io.as_ref())?,
+            }
+        }
+    }
     #[cfg(feature = "fs")]
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn attach_database_with_config(
@@ -3406,6 +3440,7 @@ impl Connection {
         alias: &str,
         reserved_space: Option<u8>,
         state: &mut AttachDatabaseState,
+        storage: Option<Arc<dyn crate::storage::database::DatabaseStorage>>,
     ) -> Result<IOResult<()>> {
         loop {
             match state {
@@ -3454,6 +3489,7 @@ impl Connection {
                         main_db_flags,
                         io,
                         self.db.dialect(),
+                        storage.clone(),
                     )?;
                     let attached_is_fresh = !db.initialized();
                     if !is_memory_db {
