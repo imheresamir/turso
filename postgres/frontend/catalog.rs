@@ -1998,10 +1998,25 @@ struct PgTypeCursor {
 }
 
 impl PgTypeCursor {
+    // Postgres exposes canonical typnames in pg_type (e.g. "integer", not the
+    // internal "int4"). Map the internal base-type names to their canonical form
+    // so `pg_type WHERE typname = 'integer'` and `'integer'::regtype` resolve.
+    // Array type names ("_int4") and already-canonical names pass through unchanged.
+    fn canonical_pg_typname(name: &str) -> &str {
+        match name {
+            "int4" => "integer",
+            "int8" => "bigint",
+            "int2" => "smallint",
+            "float4" => "real",
+            "float8" => "double precision",
+            _ => name,
+        }
+    }
+
     fn make_type_row(t: &PgTypeInfo) -> Vec<Value> {
         vec![
             Value::from_i64(t.oid),                 // oid
-            Value::build_text(t.name),              // typname
+            Value::build_text(Self::canonical_pg_typname(&t.name)), // typname
             Value::from_i64(11),                    // typnamespace (pg_catalog)
             Value::from_i64(10),                    // typowner
             Value::from_i64(t.typlen),              // typlen
