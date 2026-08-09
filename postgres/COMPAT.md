@@ -91,7 +91,7 @@ implemented.
 | Custom background workers | ❌ Not supported | |
 | Disk based FSM | ❌ Not supported | |
 | Dynamic Background Workers | ❌ Not supported | |
-| EXPLAIN (BUFFERS) support | ❌ Not supported | EXPLAIN is not supported at all |
+| EXPLAIN (BUFFERS) support | ❌ Not supported | Plain `EXPLAIN` and `EXPLAIN (ANALYZE)` are supported; BUFFERS is not |
 | EXPLAIN (MEMORY) | ❌ Not supported | |
 | EXPLAIN (SERIALIZE) support | ❌ Not supported | |
 | EXPLAIN (WAL) support | ❌ Not supported | |

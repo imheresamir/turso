@@ -4739,6 +4739,32 @@ fn node_to_literal_string(node: &pg_query::protobuf::Node) -> Option<String> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct PgExplainStmt {
+    pub query: String,
+    pub analyze: bool,
+}
+
+pub fn try_extract_explain(parse_result: &ParseResult) -> Option<PgExplainStmt> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return None;
+    }
+    let explain = match &nodes[0].0 {
+        NodeRef::ExplainStmt(e) => e,
+        _ => return None,
+    };
+    let query = explain.query.as_ref()?.deparse().ok()?;
+    let analyze = explain.options.iter().any(|opt| match &opt.node {
+        Some(Node::DefElem(def)) => def.defname.eq_ignore_ascii_case("analyze"),
+        _ => false,
+    });
+    Some(PgExplainStmt { query, analyze })
+}
+
 pub fn try_extract_execute(parse_result: &ParseResult) -> Option<PgExecuteStmt> {
     use pg_query::NodeRef;
 
