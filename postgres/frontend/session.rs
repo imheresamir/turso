@@ -11,9 +11,10 @@ use turso_core::{
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
     is_comment_on, is_refresh_matview, try_extract_copy_from, try_extract_create_schema,
-    try_extract_deallocate, try_extract_drop_schema, try_extract_execute, try_extract_prepare,
-    try_extract_set, try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt, PgDeallocateStmt,
-    PgDropSchemaStmt, PgPrepareStmt, PgSetStmt, PostgreSQLTranslator,
+    try_extract_deallocate, try_extract_drop_schema, try_extract_execute, try_extract_explain,
+    try_extract_prepare, try_extract_set, try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt,
+    PgDeallocateStmt, PgDropSchemaStmt, PgExplainStmt, PgPrepareStmt, PgSetStmt,
+    PostgreSQLTranslator,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -219,6 +220,11 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         stmt.run_ignore_rows()?;
     }
 
+    let mut stmt = match &translated.cmd {
+        ast::Cmd::Stmt(stmt) => stmt.clone(),
+        other => return Err(LimboError::ParseError(format!("cannot prepare {other:?}"))),
+    };
+    crate::srf::rewrite_stmt(&pg_conn.conn, &mut stmt);
     pg_conn
         .conn
         .prepare_translated_cmd_with_options(translated.cmd, sql, &options)
@@ -304,6 +310,11 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
         return Ok(Some(stmt));
     }
 
+    if let Some(stmt) = try_extract_explain(&parse_result) {
+        let inner = prepare_explained_stmt(pg_conn, &stmt)?;
+        return Ok(Some(inner));
+    }
+
     if let Some(stmt) = try_extract_prepare(&parse_result) {
         handle_pg_prepare(pg_conn, &stmt)?;
         return Ok(Some(noop_statement(&pg_conn.conn)?));
@@ -325,6 +336,53 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
     conn.prepare("SELECT 0 WHERE 0")
+}
+
+fn prepare_explained_stmt(
+    pg_conn: &Arc<PgConnectionInner>,
+    explain: &PgExplainStmt,
+) -> Result<Statement> {
+    let sql = explain.query.trim();
+    reject_sqlite_catalog_access(sql)?;
+
+    let parse_result =
+        turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    let translator = PostgreSQLTranslator::new();
+    let translated = translator
+        .translate_with_prereqs(&parse_result)
+        .map_err(|e| LimboError::ParseError(e.to_string()))?;
+    let stmt = match &translated.cmd {
+        ast::Cmd::Stmt(stmt) => stmt.clone(),
+        other => return Err(LimboError::ParseError(format!("cannot EXPLAIN {other:?}"))),
+    };
+    reject_catalog_dml(&stmt)?;
+
+    let options = {
+        let state = pg_conn.session_state.lock().unwrap();
+        let path = state.search_path.clone();
+        PrepareOptions {
+            unqualified_database_search_path: if path.is_empty() { None } else { Some(path) },
+        }
+    };
+    for prereq in translated.prereqs {
+        let input = prereq.to_string();
+        let mut stmt = pg_conn
+            .conn
+            .prepare_translated_stmt_with_options(prereq, &input, &options)?;
+        stmt.run_ignore_rows()?;
+    }
+
+    let cmd = if explain.analyze {
+        ast::Cmd::ExplainQueryPlan {
+            stmt,
+            format: ast::EqpFormat::Text,
+        }
+    } else {
+        ast::Cmd::Explain(stmt)
+    };
+    pg_conn
+        .conn
+        .prepare_translated_cmd_with_options(cmd, sql, &options)
 }
 
 fn execute_sqlite_internal(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {

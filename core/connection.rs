@@ -1119,11 +1119,33 @@ impl Connection {
 
     pub fn prepare_translated_cmd_with_options(
         self: &Arc<Connection>,
-        cmd: ast::Cmd,
+        cmd: Cmd,
         input: &str,
         prepare_options: &PrepareOptions,
     ) -> Result<Statement> {
-        self.prepare_cmd_with_input_and_origin(cmd, input, StatementOrigin::Root, prepare_options)
+        if self.is_closed() {
+            return Err(LimboError::InternalError("Connection closed".to_string()));
+        }
+        let origin = StatementOrigin::Root;
+        let needs_nested_guard = origin.needs_nested_guard();
+        if needs_nested_guard {
+            self.start_nested();
+        }
+        let result = (|| {
+            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, prepare_options)?;
+            Ok(Statement::new_with_origin(
+                program,
+                pager,
+                mode,
+                0,
+                origin,
+                needs_nested_guard,
+            ))
+        })();
+        if result.is_err() && needs_nested_guard {
+            self.end_nested();
+        }
+        result
     }
 
     #[turso_macros::trace_stack]
