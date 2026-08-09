@@ -1,9 +1,17 @@
+mod arrays;
 mod catalog;
+mod compound;
 mod copy;
+mod current_user;
 mod dialect;
 mod domain;
+mod explain;
 mod functions;
+mod information_schema;
 mod parse_edge_cases;
+mod pg_type;
+mod prepared;
+mod relation_size;
 mod sequence;
 mod table;
 mod type_aliases;
