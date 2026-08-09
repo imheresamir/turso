@@ -738,7 +738,8 @@ impl InternalVirtualTable for PgAttributeTable {
             attacl TEXT,
             attoptions TEXT,
             attfdwoptions TEXT,
-            attmissingval TEXT
+            attmissingval TEXT,
+            attcompression TEXT
         )"
         .to_string()
     }
@@ -803,6 +804,7 @@ impl PgAttributeCursor {
                     Value::Null,                  // attoptions
                     Value::Null,                  // attfdwoptions
                     Value::Null,                  // attmissingval
+                    Value::Text("p".into()),       // attcompression (plain)
                 ]);
             }
         }
@@ -3126,6 +3128,19 @@ pub fn pg_catalog_virtual_tables() -> Vec<Arc<VirtualTable>> {
             )
             .expect("pg_partition_ancestors virtual table creation should not fail"),
         ),
+        // unnest(array) table-valued function: expands a single array column into
+        // one row per element. psql's \d+ reloptions line uses
+        // `unnest(tc.reloptions)`; the array arrives as the function's hidden
+        // argument (a Value::Blob recording the elements in record format).
+        Arc::new(
+            VirtualTable::new_internal(
+                "unnest".to_string(),
+                UnnestTable::new().sql(),
+                VTabKind::VirtualTable,
+                Arc::new(RwLock::new(UnnestTable::new())),
+            )
+            .expect("unnest virtual table creation should not fail"),
+        ),
         // pg_sequences virtual table
         Arc::new(
             VirtualTable::new_internal(
@@ -3431,6 +3446,136 @@ impl InternalVirtualTable for PgPartitionAncestorsTable {
                 omit: false,
             })
             .collect();
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 1.0,
+            estimated_rows: 1,
+            constraint_usages: usages,
+        })
+    }
+}
+
+/// `unnest(array)` table-valued function.
+///
+/// Expands a single array column into one row per element. PostgreSQL's `unnest`
+/// is variadic and unnests multiple arrays in parallel (padding with NULL); this
+/// implementation covers the single-array form that psql's `\d+` reloptions line
+/// uses. The array arrives as the function's hidden argument as a `Value::Blob`
+/// holding the elements in the record format that the array code uses; we decode
+/// it with the public `ValueIterator`.
+#[derive(Debug)]
+struct UnnestTable;
+
+impl UnnestTable {
+    fn new() -> Self {
+        Self
+    }
+}
+
+struct UnnestCursor {
+    elements: Vec<Value>,
+    current: usize,
+}
+
+impl UnnestCursor {
+    fn new(elements: Vec<Value>) -> Self {
+        Self {
+            elements,
+            current: 0,
+        }
+    }
+}
+
+impl InternalVirtualTableCursor for UnnestCursor {
+    fn next(&mut self) -> Result<bool, LimboError> {
+        if self.current >= self.elements.len() {
+            return Ok(false);
+        }
+        self.current += 1;
+        Ok(self.current < self.elements.len())
+    }
+
+    fn rowid(&self) -> i64 {
+        self.current as i64
+    }
+
+    fn column(&self, _column: usize) -> Result<Value, LimboError> {
+        Ok(self
+            .elements
+            .get(self.current)
+            .cloned()
+            .unwrap_or(Value::Null))
+    }
+
+    fn filter(
+        &mut self,
+        args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        let array = args.first().cloned().unwrap_or(Value::Null);
+        self.elements = decode_array(&array);
+        self.current = 0;
+        Ok(true)
+    }
+}
+
+fn decode_array(array: &Value) -> Vec<Value> {
+    let decoded = match array {
+        Value::Blob(blob) => turso_core::types::ValueIterator::new(blob)
+            .ok()
+            .map(|iter| {
+                iter.filter_map(|v| v.ok())
+                    .map(|r| r.to_owned().unwrap_or(Value::Null))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Value::Null => Vec::new(),
+        other => vec![other.clone()],
+    };
+    decoded
+}
+
+impl InternalVirtualTable for UnnestTable {
+    fn name(&self) -> String {
+        "unnest".to_string()
+    }
+
+    fn sql(&self) -> String {
+        "CREATE TABLE unnest (unnest TEXT, array TEXT HIDDEN)".to_string()
+    }
+
+    fn open(
+        &self,
+        _conn: Arc<Connection>,
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(UnnestCursor::new(Vec::new()))))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        // The array argument arrives as the HIDDEN column (index 1); bind it to
+        // argv 1 so the planner supplies it to the cursor's filter().
+        let mut usages = constraints
+            .iter()
+            .map(|_| turso_ext::ConstraintUsage {
+                argv_index: None,
+                omit: false,
+            })
+            .collect::<Vec<_>>();
+        for (i, c) in constraints.iter().enumerate() {
+            if c.column_index as usize == 1 && c.usable {
+                usages[i] = turso_ext::ConstraintUsage {
+                    argv_index: Some(1),
+                    omit: true,
+                };
+            }
+        }
         Ok(IndexInfo {
             idx_num: 0,
             idx_str: None,

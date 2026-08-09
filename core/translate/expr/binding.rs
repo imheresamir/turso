@@ -145,6 +145,22 @@ pub fn bind_and_rewrite_expr<'a>(
                                     col.is_rowid_alias(),
                                 ));
                             }
+                        // PostgreSQL: a single-column relation aliased as `t` exposes that
+                        // column under the alias name too (e.g. `unnest(...) x` → `x`).
+                        } else if joined_table
+                            .table
+                            .columns()
+                            .iter()
+                            .filter(|c| !c.hidden())
+                            .count()
+                            == 1
+                            && joined_table
+                                .identifier
+                                .eq_ignore_ascii_case(&normalized_id)
+                        {
+                            if match_result.is_none() {
+                                match_result = Some((joined_table.internal_id, 0, false));
+                            }
                         // only if we haven't found a match, check for explicit rowid reference
                         } else if let Table::BTree(btree) = &joined_table.table {
                             if let Some(row_id_expr) =
@@ -210,9 +226,24 @@ pub fn bind_and_rewrite_expr<'a>(
                                 match_result =
                                     Some((outer_ref.internal_id, col_idx, col.is_rowid_alias()));
                                 matched_scope_depth = Some(outer_ref.scope_depth);
-                            }
-                        }
-                    }
+                                } else if outer_ref
+                                    .table
+                                    .columns()
+                                    .iter()
+                                    .filter(|c| !c.hidden())
+                                    .count()
+                                    == 1
+                                    && outer_ref
+                                        .identifier
+                                        .eq_ignore_ascii_case(&normalized_id)
+                                {
+                                if match_result.is_none() {
+                                    match_result = Some((outer_ref.internal_id, 0, false));
+                                    matched_scope_depth = Some(outer_ref.scope_depth);
+                                }
+                                }
+                                }
+                                }
 
                     if let Some((table_id, col_idx, is_rowid_alias)) = match_result {
                         *expr = Expr::Column {

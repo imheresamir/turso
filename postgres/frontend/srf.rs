@@ -1,8 +1,17 @@
 use std::sync::Arc;
 
-use turso_core::{schema::Table, Connection};
+use turso_core::schema::Table;
+use turso_core::Connection;
 use turso_parser::ast;
 
+/// Rewrite set-returning-function constructs that the core planner does not
+/// support, into shapes it does.
+///
+/// A single, FROM-less, single-target-list call to a catalog table-valued
+/// function (e.g. `pg_partition_ancestors('16384')') is exactly a `TableCall`
+/// scan, so it is lifted into `SELECT <first visible column> FROM tvf(args)`.
+/// TVF-ness is detected from the registered virtual table's hidden columns
+/// (which are the call arguments) — no function-name list is duplicated.
 pub fn rewrite_stmt(conn: &Arc<Connection>, stmt: &mut ast::Stmt) {
     match stmt {
         ast::Stmt::Select(select) => rewrite_select(conn, select),
@@ -26,8 +35,27 @@ pub fn rewrite_stmt(conn: &Arc<Connection>, stmt: &mut ast::Stmt) {
 }
 
 fn rewrite_select(conn: &Arc<Connection>, select: &mut ast::Select) {
-    rewrite_one_select(conn, &mut select.body.select);
-    for compound in &mut select.body.compounds {
+    let ast::Select {
+        body,
+        order_by,
+        limit,
+        ..
+    } = select;
+    rewrite_body(conn, body);
+    for col in order_by.iter_mut() {
+        rewrite_expr(conn, &mut col.expr);
+    }
+    if let Some(limit) = limit {
+        rewrite_expr(conn, &mut limit.expr);
+        if let Some(offset) = &mut limit.offset {
+            rewrite_expr(conn, offset);
+        }
+    }
+}
+
+fn rewrite_body(conn: &Arc<Connection>, body: &mut ast::SelectBody) {
+    rewrite_one_select(conn, &mut body.select);
+    for compound in &mut body.compounds {
         rewrite_one_select(conn, &mut compound.select);
     }
 }
@@ -43,37 +71,39 @@ fn rewrite_one_select(conn: &Arc<Connection>, one: &mut ast::OneSelect) {
         return;
     };
 
-    if let Some(where_clause) = where_clause.as_deref_mut() {
-        rewrite_expr(conn, where_clause);
+    // Lift a FROM-less single-target-list TVF call into a TableCall scan.
+    if from.is_none() && columns.len() == 1 {
+        if let ast::ResultColumn::Expr(expr, alias) = &mut columns[0] {
+            if let ast::Expr::FunctionCall { name, args, .. } = expr.as_ref() {
+                if let Some(first_column) = tvf_first_column(conn, name.as_str(), args.len()) {
+                    let call = ast::SelectTable::TableCall(
+                        ast::QualifiedName::single(name.clone()),
+                        args.clone(),
+                        None,
+                    );
+                    let projected = ast::Expr::Id(ast::Name::from_string(first_column));
+                    columns[0] = ast::ResultColumn::Expr(Box::new(projected), alias.clone());
+                    *from = Some(ast::FromClause {
+                        select: Box::new(call),
+                        joins: vec![],
+                    });
+                    return;
+                }
+            }
+        }
+    }
+
+    for column in columns.iter_mut() {
+        if let ast::ResultColumn::Expr(expr, _) = column {
+            rewrite_expr(conn, expr);
+        }
     }
     if let Some(from) = from.as_mut() {
         rewrite_from(conn, from);
     }
-
-    if from.is_some() || columns.len() != 1 {
-        return;
+    if let Some(where_clause) = where_clause.as_deref_mut() {
+        rewrite_expr(conn, where_clause);
     }
-    let ast::ResultColumn::Expr(expr, alias) = &columns[0] else {
-        return;
-    };
-    let ast::Expr::FunctionCall { name, args, .. } = expr.as_ref() else {
-        return;
-    };
-    let Some(first_column) = tvf_first_column(conn, name.as_str(), args.len()) else {
-        return;
-    };
-
-    let call = ast::SelectTable::TableCall(
-        ast::QualifiedName::single(name.clone()),
-        args.clone(),
-        None,
-    );
-    let projected = ast::Expr::Id(ast::Name::from_string(first_column));
-    *columns = vec![ast::ResultColumn::Expr(Box::new(projected), alias.clone())];
-    *from = Some(ast::FromClause {
-        select: Box::new(call),
-        joins: vec![],
-    });
 }
 
 fn rewrite_from(conn: &Arc<Connection>, from: &mut ast::FromClause) {

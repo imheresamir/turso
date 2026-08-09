@@ -3480,8 +3480,8 @@ impl PostgreSQLTranslator {
         match sub_link.sub_link_type() {
             SubLinkType::ExistsSublink => Ok(ast::Expr::Exists(select)),
             SubLinkType::ExprSublink => Ok(ast::Expr::Subquery(select)),
+            SubLinkType::ArraySublink => Ok(self.translate_array_sublink(select)),
             SubLinkType::AnySublink => {
-                // ANY/IN subquery: testexpr IN (SELECT ...)
                 let test_node = sub_link.testexpr.as_ref().ok_or_else(|| {
                     ParseError::ParseError("ANY SubLink missing testexpr".to_string())
                 })?;
@@ -3496,6 +3496,71 @@ impl PostgreSQLTranslator {
                 "Unsupported SubLink type: {other:?}",
             ))),
         }
+    }
+
+    /// Rewrite an `array(<subquery>)` ArraySublink into a scalar subquery that
+    /// aggregates the subquery's first column into an array:
+    /// `(SELECT array_agg(<col>) FROM <rest>)`.
+    ///
+    /// The core planner has no `array(subquery)` expression, but `array_agg`
+    /// over a scalar subquery already executes and yields an array stored in the
+    /// existing `Value::Blob` record format. This keeps the change confined to
+    /// the PostgreSQL translator — no core `Value`/`Expr` variants needed.
+    ///
+    /// PostgreSQL requires the subquery to return exactly one column; the rewrite
+    /// aggregates `*` if the subquery uses `SELECT *` (which collapses to the sole
+    /// column for a single-column source).
+    fn translate_array_sublink(&self, subquery: ast::Select) -> ast::Expr {
+        let first_column = match &subquery.body {
+            ast::SelectBody { select: one, .. } => match one {
+                ast::OneSelect::Select { columns, .. } => match columns.first() {
+                    Some(ast::ResultColumn::Expr(e, _)) => (**e).clone(),
+                    Some(ast::ResultColumn::Star) => ast::Expr::Literal(ast::Literal::Numeric(
+                        "1".to_string(),
+                    )),
+                    _ => ast::Expr::Literal(ast::Literal::Numeric("1".to_string())),
+                },
+                _ => ast::Expr::Literal(ast::Literal::Numeric("1".to_string())),
+            },
+            _ => ast::Expr::Literal(ast::Literal::Numeric("1".to_string())),
+        };
+        let agg = ast::Expr::FunctionCall {
+            name: ast::Name::from_string("array_agg"),
+            distinctness: None,
+            args: vec![Box::new(first_column)],
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+        let mut inner = subquery;
+        let (from, where_clause) = match &mut inner.body {
+            ast::SelectBody { select: one, .. } => match one {
+                ast::OneSelect::Select {
+                    from, where_clause, ..
+                } => (from.clone(), where_clause.clone()),
+                _ => (None, None),
+            },
+            _ => (None, None),
+        };
+        ast::Expr::Subquery(ast::Select {
+            with: None,
+            body: ast::SelectBody {
+                select: ast::OneSelect::Select {
+                    distinctness: None,
+                    columns: vec![ast::ResultColumn::Expr(Box::new(agg), None)],
+                    from,
+                    where_clause,
+                    group_by: None,
+                    window_clause: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        })
     }
 
     fn translate_with_clause(
