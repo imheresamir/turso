@@ -5,6 +5,14 @@ use turso_parser::ast::RefAct;
 
 const USER_TABLE_OID_START: i64 = 16384;
 
+/// Captured once at library load: the process start time, used by
+/// `pg_postmaster_start_time()`.
+static PROCESS_START_TIME: std::sync::OnceLock<std::time::SystemTime> = std::sync::OnceLock::new();
+
+fn process_start_time() -> std::time::SystemTime {
+    *PROCESS_START_TIME.get_or_init(std::time::SystemTime::now)
+}
+
 /// Resolve a PostgreSQL scalar function by name and argument count. Entry
 /// point for [`crate::catalog::PostgresDialect::resolve_function`].
 pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
@@ -24,6 +32,11 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         "pg_get_expr" => &[2, 3],
         "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" => &[2],
         "version" | "current_database" | "current_schema" | "pg_backend_pid" => &[0],
+        "current_setting" => &[1, 2],
+        "current_schemas" => &[1],
+        "txid_current" => &[0],
+        "pg_postmaster_start_time" => &[0],
+        "pg_size_pretty" => &[1],
         _ => return false,
     };
     arities.contains(&(arg_count as i64))
@@ -64,6 +77,11 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         // namespace, so that is always the current schema.
         "current_schema" => Ok(Value::build_text("public")),
         "pg_backend_pid" => Ok(Value::from_i64(std::process::id() as i64)),
+        "current_setting" => Ok(exec_current_setting(conn, text_arg(0))),
+        "current_schemas" => Ok(exec_current_schemas(conn, int_arg(0, 0) != 0)),
+        "txid_current" => Ok(exec_txid_current(conn)),
+        "pg_postmaster_start_time" => Ok(exec_pg_postmaster_start_time()),
+        "pg_size_pretty" => Ok(exec_pg_size_pretty(int_arg(0, 0))),
         "quote_ident" => match args.first() {
             Some(Value::Null) | None => Ok(Value::Null),
             _ => Ok(Value::build_text(turso_pg_parser::quote_identifier(
@@ -86,6 +104,76 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
 
 fn exec_pg_get_user_by_id(_oid: i64) -> Value {
     Value::build_text("turso")
+}
+
+fn exec_current_setting(conn: &Connection, name: String) -> Value {
+    // Minimal GUC store for the settings clients probe most. Unknown settings
+    // return empty text rather than erroring, so ORMs that query a setting we
+    // don't model still get a value. search_path is the hardcoded "public"
+    // namespace this frontend presents (see current_schema).
+    let value = match name.to_ascii_lowercase().as_str() {
+        "search_path" => "public".to_string(),
+        "timezone" => "UTC".to_string(),
+        "server_encoding" => "UTF8".to_string(),
+        "client_encoding" => "UTF8".to_string(),
+        "datestyle" => "ISO, MDY".to_string(),
+        "intervalstyle" => "postgres".to_string(),
+        "standard_conforming_strings" => "on".to_string(),
+        "integer_datetimes" => "on".to_string(),
+        "application_name" => String::new(),
+        "client_min_messages" => "notice".to_string(),
+        "lc_collate" => "en_US.UTF-8".to_string(),
+        "lc_ctype" => "en_US.UTF-8".to_string(),
+        "is_superuser" => "off".to_string(),
+        "transaction_isolation" => "read committed".to_string(),
+        _ => String::new(),
+    };
+    Value::build_text(value)
+}
+
+fn exec_current_schemas(_conn: &Connection, _include_implicit: bool) -> Value {
+    // Value has no array variant; return the Postgres array literal form so
+    // consumers that stringify it (psql, ORMs) see the expected shape. The
+    // frontend presents a single hardcoded "public" namespace.
+    Value::build_text("{\"public\"}")
+}
+
+fn exec_txid_current(_conn: &Connection) -> Value {
+    // Turso does not expose a transaction id through the public Connection API.
+    // Return 0 — a stable, non-erroring value for the compat surface; real txid
+    // tracking would require a per-connection counter in the frontend.
+    Value::from_i64(0)
+}
+
+fn exec_pg_postmaster_start_time() -> Value {
+    let start = process_start_time();
+    let secs = start
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).unwrap_or_default();
+    Value::build_text(dt.format("%Y-%m-%d %H:%M:%S%:z").to_string())
+}
+
+fn exec_pg_size_pretty(bytes: i64) -> Value {
+    if bytes < 1024 {
+        return Value::build_text(format!("{bytes} bytes"));
+    }
+    const UNITS: &[&str] = &["kB", "MB", "GB", "TB", "PB", "EB"];
+    let mut size = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    let text = if size >= 10.0 || size == size.trunc() {
+        format!("{} {}", size as i64, UNITS[unit])
+    } else if size >= 1.0 {
+        format!("{size:.1} {}", UNITS[unit])
+    } else {
+        format!("{size:.2} {}", UNITS[unit])
+    };
+    Value::build_text(text)
 }
 
 fn exec_pg_is_visible(_oid: i64) -> Value {
