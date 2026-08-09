@@ -72,6 +72,32 @@ pub fn open_database_with_io(
     )
 }
 
+/// Open a database with the PostgreSQL schema dialect on an existing IO
+/// backend, using a caller-provided page storage backend instead of Turso's
+/// built-in file storage.
+///
+/// This is the storage-injection seam that lets embedders back the PostgreSQL
+/// frontend with a custom `DatabaseStorage` (e.g. an in-memory or remote KV
+/// store) while still registering the `pg_catalog` virtual tables that
+/// `PostgresDialect::register_catalog` installs. `open_database_with_io`
+/// hardcodes `DatabaseFile` storage and cannot be used with a custom backend.
+pub fn open_database_with_storage(
+    io: Arc<dyn turso_core::IO>,
+    path: &str,
+    flags: turso_core::OpenFlags,
+    opts: turso_core::DatabaseOpts,
+    storage: Arc<dyn turso_core::storage::database::DatabaseStorage>,
+) -> Result<Arc<turso_core::Database>> {
+    turso_core::Database::open(
+        io,
+        path,
+        turso_core::OpenOptions::new(Arc::new(PostgresDialect))
+            .storage(storage)
+            .flags(flags)
+            .db_opts(opts),
+    )
+}
+
 impl PgConnection {
     pub fn new(conn: Arc<Connection>) -> Self {
         aliases::install(&conn);
