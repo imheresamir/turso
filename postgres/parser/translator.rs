@@ -1617,6 +1617,27 @@ impl PostgreSQLTranslator {
             ));
         }
 
+        // VALUES clause as a compound leaf (e.g. `SELECT 1 UNION ALL VALUES (2)`):
+        // pg_query represents it as a SelectStmt with values_lists populated and an
+        // empty target_list. Translate it to OneSelect::Values so it composes with
+        // the surrounding set operation.
+        if !select.values_lists.is_empty() && select.target_list.is_empty() {
+            let mut rows = Vec::new();
+            for row_node in &select.values_lists {
+                let Some(pg_query::protobuf::node::Node::List(list)) = &row_node.node else {
+                    return Err(ParseError::ParseError(
+                        "VALUES: expected list node".to_string(),
+                    ));
+                };
+                let mut exprs = Vec::new();
+                for item in &list.items {
+                    exprs.push(Box::new(self.translate_expr(item)?));
+                }
+                rows.push(exprs);
+            }
+            return Ok(ast::OneSelect::Values(rows));
+        }
+
         let from_clause = if !select.from_clause.is_empty() {
             Some(self.translate_from_items(&select.from_clause)?)
         } else {

@@ -3116,6 +3116,16 @@ pub fn pg_catalog_virtual_tables() -> Vec<Arc<VirtualTable>> {
             )
             .expect("pg_input_error_info virtual table creation should not fail"),
         ),
+        // pg_partition_ancestors table-valued function (always empty: no partitioning)
+        Arc::new(
+            VirtualTable::new_internal(
+                "pg_partition_ancestors".to_string(),
+                PgPartitionAncestorsTable::new().sql(),
+                VTabKind::VirtualTable,
+                Arc::new(RwLock::new(PgPartitionAncestorsTable::new())),
+            )
+            .expect("pg_partition_ancestors virtual table creation should not fail"),
+        ),
         // pg_sequences virtual table
         Arc::new(
             VirtualTable::new_internal(
@@ -3331,6 +3341,96 @@ impl InternalVirtualTable for PgInputErrorInfoTable {
             };
         }
 
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 1.0,
+            estimated_rows: 1,
+            constraint_usages: usages,
+        })
+    }
+}
+
+/// Table-valued function: `pg_partition_ancestors(regclass)`
+///
+/// Returns the OIDs of the ancestor partitions of a partitioned table. KELSO
+/// does not support table partitioning, so this always returns zero rows — which
+/// matches Postgres behavior for a non-partitioned table and lets psql's `\d`
+/// foreign-key introspection query (`... UNION ALL VALUES ('oid'::regclass)`)
+/// fall through to the VALUES clause.
+#[derive(Debug)]
+struct PgPartitionAncestorsTable;
+
+impl PgPartitionAncestorsTable {
+    fn new() -> Self {
+        Self
+    }
+}
+
+struct PgPartitionAncestorsCursor {
+    returned: bool,
+}
+
+impl PgPartitionAncestorsCursor {
+    fn new() -> Self {
+        Self { returned: false }
+    }
+}
+
+impl InternalVirtualTableCursor for PgPartitionAncestorsCursor {
+    fn next(&mut self) -> Result<bool, LimboError> {
+        // Always empty: no partition ancestors.
+        Ok(false)
+    }
+
+    fn rowid(&self) -> i64 {
+        0
+    }
+
+    fn column(&self, _column: usize) -> Result<Value, LimboError> {
+        Ok(Value::Null)
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        self.returned = false;
+        Ok(true)
+    }
+}
+
+impl InternalVirtualTable for PgPartitionAncestorsTable {
+    fn name(&self) -> String {
+        "pg_partition_ancestors".to_string()
+    }
+
+    fn sql(&self) -> String {
+        "CREATE TABLE pg_partition_ancestors (pg_partition_ancestors INTEGER, regclass TEXT HIDDEN)".to_string()
+    }
+
+    fn open(
+        &self,
+        _conn: Arc<Connection>,
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(PgPartitionAncestorsCursor::new())))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        let usages = constraints
+            .iter()
+            .map(|_| turso_ext::ConstraintUsage {
+                argv_index: None,
+                omit: false,
+            })
+            .collect();
         Ok(IndexInfo {
             idx_num: 0,
             idx_str: None,
