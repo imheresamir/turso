@@ -804,7 +804,7 @@ impl PgAttributeCursor {
                     Value::Null,                  // attoptions
                     Value::Null,                  // attfdwoptions
                     Value::Null,                  // attmissingval
-                    Value::Text("p".into()),       // attcompression (plain)
+                    Value::Text("p".into()),      // attcompression (plain)
                 ]);
             }
         }
