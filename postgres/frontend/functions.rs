@@ -37,6 +37,7 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         "txid_current" => &[0],
         "pg_postmaster_start_time" => &[0],
         "pg_size_pretty" => &[1],
+        "pg_table_size" | "pg_relation_size" | "pg_total_relation_size" | "pg_indexes_size" => &[1],
         _ => return false,
     };
     arities.contains(&(arg_count as i64))
@@ -82,6 +83,10 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         "txid_current" => Ok(exec_txid_current(conn)),
         "pg_postmaster_start_time" => Ok(exec_pg_postmaster_start_time()),
         "pg_size_pretty" => Ok(exec_pg_size_pretty(int_arg(0, 0))),
+        "pg_table_size" | "pg_relation_size" | "pg_total_relation_size" => {
+            Ok(exec_pg_relation_size(conn, int_arg(0, 0)))
+        }
+        "pg_indexes_size" => Ok(exec_pg_indexes_size(conn, int_arg(0, 0))),
         "quote_ident" => match args.first() {
             Some(Value::Null) | None => Ok(Value::Null),
             _ => Ok(Value::build_text(turso_pg_parser::quote_identifier(
@@ -139,10 +144,32 @@ fn exec_current_schemas(_conn: &Connection, _include_implicit: bool) -> Value {
 }
 
 fn exec_txid_current(_conn: &Connection) -> Value {
-    // Turso does not expose a transaction id through the public Connection API.
-    // Return 0 — a stable, non-erroring value for the compat surface; real txid
-    // tracking would require a per-connection counter in the frontend.
-    Value::from_i64(0)
+    // Turso does not expose a transaction id through the public Connection API,
+    // so mint a process-wide monotonically increasing xid. This is non-zero and
+    // strictly increasing across calls, matching the shape clients expect
+    // (PG returns a real, incrementing xid) without a per-connection counter.
+    static NEXT_XID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+    let xid = NEXT_XID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Value::from_i64(xid)
+}
+
+/// Return the on-disk byte size of the relation backing `oid`.
+///
+/// Turso stores every relation in a single database file (user tables in the
+/// main db; PG schemas as attached celld cells). A per-table byte size is not a
+/// native SQLite concept, so — like other PG-compat shims — we approximate by
+/// returning the size of the underlying database file. This is the value psql's
+/// `\dt+` surfaces as the relation "Size"; any positive integer unblocks the
+/// command. The oid argument is accepted for signature compatibility and, when
+/// resolvable to a known relation, could later narrow to that relation's file.
+fn exec_pg_relation_size(conn: &Connection, _oid: i64) -> Value {
+    Value::from_i64(conn.database_file_size())
+}
+
+/// Total size of a relation: table data plus its associated indexes/toast.
+/// In the single-file model this equals the database file size.
+fn exec_pg_indexes_size(conn: &Connection, _oid: i64) -> Value {
+    Value::from_i64(conn.database_file_size())
 }
 
 fn exec_pg_postmaster_start_time() -> Value {

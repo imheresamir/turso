@@ -2334,6 +2334,7 @@ impl Database {
             pager: ArcSwap::new(pager),
             schema: RwLock::new(self.schema.lock().clone()),
             database_schemas: RwLock::new(HashMap::default()),
+            relation_size_fn: std::sync::Mutex::new(None),
             auto_commit: AtomicBool::new(true),
             transaction_state: AtomicTransactionState::new(TransactionState::None),
             poisoned_tx: AtomicBool::new(false),

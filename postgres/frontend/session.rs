@@ -57,6 +57,12 @@ impl PgConnection {
     pub fn set_schema_drop(&self, f: Arc<dyn Fn(&str) + Send + Sync>) {
         *self.inner.schema_drop.lock().unwrap() = Some(f);
     }
+    /// Register a closure reporting the backing celld cell's on-disk byte size.
+    /// The PostgreSQL compat layer uses this for `pg_table_size` and friends,
+    /// which have no per-relation size in the single-file model.
+    pub fn set_relation_size_fn(&self, f: Arc<dyn Fn() -> i64 + Send + Sync>) {
+        self.inner.conn.set_relation_size_fn(f);
+    }
 }
 
 struct PgConnectionInner {

@@ -2312,8 +2312,12 @@ impl PostgreSQLTranslator {
                         | SqlValueFunctionOp::SvfopUser
                         | SqlValueFunctionOp::SvfopCurrentRole,
                     ) => {
-                        // Return empty string stub for user functions
-                        Ok(ast::Expr::Literal(ast::Literal::String("''".into())))
+                        // Return the well-known superuser role. pg_roles and
+                        // pg_get_userbyid already advertise "turso", and the
+                        // frontend presents every object under it, so surfacing
+                        // that role here keeps current_user/session_user/user in
+                        // agreement with the rest of the catalog.
+                        Ok(ast::Expr::Literal(ast::Literal::String("turso".into())))
                     }
                     // The bare keywords route through the frontend scalars so both
                     // syntaxes share one implementation and agree with pg_catalog.

@@ -354,6 +354,10 @@ pub struct Connection {
     /// Per-database schema cache (database_index -> schema)
     /// Loaded lazily to avoid copying all schemas on connection open
     pub(super) database_schemas: RwLock<HashMap<usize, Arc<Schema>>>,
+    /// Optional provider for the backing store's on-disk byte size, registered
+    /// by the embedding application. The PostgreSQL compat layer (`pg_table_size`
+    /// and friends) reads this to surface a relation size.
+    pub(super) relation_size_fn: std::sync::Mutex<Option<Arc<dyn Fn() -> i64 + Send + Sync>>>,
     /// Whether to automatically commit transaction
     pub(crate) auto_commit: AtomicBool,
     pub(super) transaction_state: AtomicTransactionState,
@@ -4425,6 +4429,27 @@ impl Connection {
     #[doc(hidden)]
     pub fn db_file_path(&self) -> &str {
         &self.db.path
+    }
+
+    /// Return the on-disk byte size of the main database file.
+    ///
+    /// Used by the PostgreSQL compat surface (`pg_table_size` and friends) to
+    /// surface a relation size. Turso stores every relation in a single
+    /// database file, so this is the closest meaningful analog; per-table byte
+    /// sizes are not a native SQLite concept. The size provider is registered
+    /// by the embedding application (e.g. KELSO supplies the celld cell size);
+    /// when none is set this returns 0.
+    #[doc(hidden)]
+    pub fn database_file_size(&self) -> i64 {
+        let guard = self.relation_size_fn.lock().unwrap();
+        guard.as_ref().map(|f| f()).unwrap_or(0)
+    }
+
+    /// Register a closure that reports the backing store's on-disk byte size.
+    /// The PostgreSQL compat layer uses this for `pg_table_size` and friends.
+    #[doc(hidden)]
+    pub fn set_relation_size_fn(&self, f: Arc<dyn Fn() -> i64 + Send + Sync>) {
+        *self.relation_size_fn.lock().unwrap() = Some(f);
     }
 
     /// Create a `TempDir` honoring `TURSO_TMPDIR` and `SQLITE_TMPDIR`,
