@@ -358,6 +358,10 @@ pub struct Connection {
     /// by the embedding application. The PostgreSQL compat layer (`pg_table_size`
     /// and friends) reads this to surface a relation size.
     pub(super) relation_size_fn: std::sync::Mutex<Option<Arc<dyn Fn() -> i64 + Send + Sync>>>,
+    /// Authenticated role for the session, set by the embedding application via
+    /// `set_current_user`. `current_user` / `session_user` / `user` / `current_role`
+    /// read this. Falls back to `turso` when unset (e.g. non-kelso embedders).
+    pub(super) current_user: std::sync::Mutex<Option<String>>,
     /// Whether to automatically commit transaction
     pub(crate) auto_commit: AtomicBool,
     pub(super) transaction_state: AtomicTransactionState,
@@ -4450,6 +4454,24 @@ impl Connection {
     #[doc(hidden)]
     pub fn set_relation_size_fn(&self, f: Arc<dyn Fn() -> i64 + Send + Sync>) {
         *self.relation_size_fn.lock().unwrap() = Some(f);
+    }
+
+    /// Register the authenticated role for the session. The PostgreSQL compat
+    /// layer reads this via `current_user` / `session_user` / `user` /
+    /// `current_role`.
+    #[doc(hidden)]
+    pub fn set_current_user(&self, user: String) {
+        *self.current_user.lock().unwrap() = Some(user);
+    }
+
+    /// The authenticated role for the session, or `turso` when unset.
+    #[doc(hidden)]
+    pub fn current_user(&self) -> String {
+        self.current_user
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "turso".to_string())
     }
 
     /// Create a `TempDir` honoring `TURSO_TMPDIR` and `SQLITE_TMPDIR`,

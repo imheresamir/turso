@@ -63,6 +63,12 @@ impl PgConnection {
     pub fn set_relation_size_fn(&self, f: Arc<dyn Fn() -> i64 + Send + Sync>) {
         self.inner.conn.set_relation_size_fn(f);
     }
+
+    /// Register the authenticated role for the session. `current_user` /
+    /// `session_user` / `user` / `current_role` surface this value.
+    pub fn set_current_user(&self, user: String) {
+        self.inner.conn.set_current_user(user);
+    }
 }
 
 struct PgConnectionInner {

@@ -32,6 +32,7 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         "pg_get_expr" => &[2, 3],
         "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" => &[2],
         "version" | "current_database" | "current_schema" | "pg_backend_pid" => &[0],
+        "current_user" | "session_user" | "user" | "current_role" => &[0],
         "current_setting" => &[1, 2],
         "current_schemas" => &[1],
         "txid_current" => &[0],
@@ -77,6 +78,9 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         // pg_catalog presents every user object under the hardcoded "public"
         // namespace, so that is always the current schema.
         "current_schema" => Ok(Value::build_text("public")),
+        "current_user" | "session_user" | "user" | "current_role" => {
+            Ok(exec_current_user(conn))
+        }
         "pg_backend_pid" => Ok(Value::from_i64(std::process::id() as i64)),
         "current_setting" => Ok(exec_current_setting(conn, text_arg(0))),
         "current_schemas" => Ok(exec_current_schemas(conn, int_arg(0, 0) != 0)),
@@ -109,6 +113,16 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
 
 fn exec_pg_get_user_by_id(_oid: i64) -> Value {
     Value::build_text("turso")
+}
+
+/// Return the authenticated role for the session.
+///
+/// The embedder sets this via `Connection::set_current_user` (kelso feeds the
+/// pgwire `user` startup parameter through). When unset we fall back to the
+/// well-known `turso` superuser so `current_user` still agrees with
+/// `pg_roles` / `pg_get_userbyid` for non-kelso embedders.
+fn exec_current_user(conn: &Connection) -> Value {
+    Value::build_text(conn.current_user())
 }
 
 fn exec_current_setting(conn: &Connection, name: String) -> Value {

@@ -2312,12 +2312,23 @@ impl PostgreSQLTranslator {
                         | SqlValueFunctionOp::SvfopUser
                         | SqlValueFunctionOp::SvfopCurrentRole,
                     ) => {
-                        // Return the well-known superuser role. pg_roles and
-                        // pg_get_userbyid already advertise "turso", and the
-                        // frontend presents every object under it, so surfacing
-                        // that role here keeps current_user/session_user/user in
-                        // agreement with the rest of the catalog.
-                        Ok(ast::Expr::Literal(ast::Literal::String("turso".into())))
+                        // Route through the frontend scalar so the value tracks
+                        // the actual authenticated role (set by the embedder via
+                        // Connection::set_current_user), instead of a hardcoded
+                        // literal. This keeps current_user/session_user/user/
+                        // current_role equal to one another and to the login role,
+                        // matching PostgreSQL.
+                        Ok(ast::Expr::FunctionCall {
+                            name: ast::Name::from_string("current_user"),
+                            distinctness: None,
+                            args: vec![],
+                            order_by: vec![],
+                            within_group: vec![],
+                            filter_over: ast::FunctionTail {
+                                filter_clause: None,
+                                over_clause: None,
+                            },
+                        })
                     }
                     // The bare keywords route through the frontend scalars so both
                     // syntaxes share one implementation and agree with pg_catalog.
