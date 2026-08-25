@@ -94,60 +94,80 @@ impl SqlBackend for PgBackend {
             }
         };
 
-        // Reserve an ephemeral port, then hand it to the server. The port
-        // could in principle be claimed between the drop and the spawn, in
-        // which case the server fails to bind and the readiness loop below
-        // reports the exit.
-        let port = TcpListener::bind("127.0.0.1:0")
-            .and_then(|l| l.local_addr())
-            .map_err(|e| BackendError::CreateDatabase(format!("allocating port: {e}")))?
-            .port();
+        // Reserve an ephemeral port, then hand it to the server. The port can
+        // be claimed by another concurrently spawning server between the drop
+        // and the child's bind; on that failure, retry with a fresh port a few
+        // times before giving up.
+        // A bind failure consumes one retry; give up after PORT_RETRIES.
+        let mut port_retries_left = 3usize;
+        let (child, conn) = 'retry: loop {
+            let port = TcpListener::bind("127.0.0.1:0")
+                .and_then(|l| l.local_addr())
+                .map_err(|e| BackendError::CreateDatabase(format!("allocating port: {e}")))?
+                .port();
 
-        let mut cmd = tokio::process::Command::new(&self.binary_path);
-        cmd.arg(&db_path)
-            .arg("--server")
-            .arg(format!("127.0.0.1:{port}"))
-            .arg("-q");
-        if config.readonly {
-            cmd.arg("--readonly");
-        }
-        cmd.stdin(std::process::Stdio::null());
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::piped());
-        cmd.kill_on_drop(true);
-        let mut child = cmd.spawn().map_err(|e| {
-            BackendError::CreateDatabase(format!(
-                "failed to spawn {}: {e}",
-                self.binary_path.display()
-            ))
-        })?;
+            let mut cmd = tokio::process::Command::new(&self.binary_path);
+            cmd.arg(&db_path)
+                .arg("--server")
+                .arg(format!("127.0.0.1:{port}"))
+                .arg("-q");
+            if config.readonly {
+                cmd.arg("--readonly");
+            }
+            cmd.stdin(std::process::Stdio::null());
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::piped());
+            cmd.kill_on_drop(true);
+            let mut child = cmd.spawn().map_err(|e| {
+                BackendError::CreateDatabase(format!(
+                    "failed to spawn {}: {e}",
+                    self.binary_path.display()
+                ))
+            })?;
 
-        let params = ConnParams {
-            host: "127.0.0.1".to_string(),
-            port,
-            user: "sqltest".to_string(),
-            password: None,
-            database: "main".to_string(),
-        };
+            let params = ConnParams {
+                host: "127.0.0.1".to_string(),
+                port,
+                user: "sqltest".to_string(),
+                password: None,
+                database: "main".to_string(),
+            };
 
-        // Wait for the server to accept the startup handshake.
-        let deadline = Instant::now() + SERVER_STARTUP_TIMEOUT;
-        let conn = loop {
-            match connect(&params).await {
-                Ok(conn) => break conn,
-                Err(e) => {
-                    if let Some(status) = child.try_wait().ok().flatten() {
-                        let stderr = read_stderr(&mut child).await;
-                        return Err(BackendError::CreateDatabase(format!(
-                            "tursopg exited with {status} before accepting connections: {stderr}"
-                        )));
+            // Wait for the server to accept the startup handshake.
+            let deadline = Instant::now() + SERVER_STARTUP_TIMEOUT;
+            let bind_failure = loop {
+                match connect(&params).await {
+                    Ok(conn) => break Some((child, conn)),
+                    Err(e) => {
+                        if let Some(status) = child.try_wait().ok().flatten() {
+                            let stderr = read_stderr(&mut child).await;
+                            let msg = format!(
+                                "tursopg exited with {status} before accepting connections: {stderr}"
+                            );
+                            if stderr.contains("Address already in use") {
+                                break None;
+                            }
+                            return Err(BackendError::CreateDatabase(msg));
+                        }
+                        if Instant::now() >= deadline {
+                            return Err(BackendError::CreateDatabase(format!(
+                                "tursopg did not accept connections within {SERVER_STARTUP_TIMEOUT:?}: {e}"
+                            )));
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
                     }
-                    if Instant::now() >= deadline {
-                        return Err(BackendError::CreateDatabase(format!(
-                            "tursopg did not accept connections within {SERVER_STARTUP_TIMEOUT:?}: {e}"
-                        )));
+                }
+            };
+            match bind_failure {
+                Some(ok) => break ok,
+                None => {
+                    if port_retries_left == 0 {
+                        return Err(BackendError::CreateDatabase(
+                            "tursopg repeatedly failed to bind an ephemeral port".to_string(),
+                        ));
                     }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    port_retries_left -= 1;
+                    continue 'retry;
                 }
             }
         };
