@@ -1,4 +1,5 @@
 mod catalog;
+mod compound;
 mod copy;
 mod dialect;
 mod domain;
