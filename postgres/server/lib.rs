@@ -60,11 +60,7 @@ impl TursoPgServer {
         );
 
         let factory = Arc::new(TursoPgFactory {
-            handler: Arc::new(TursoPgHandler {
-                conn: self.conn.clone(),
-                db_file: self.db_file.clone(),
-                query_parser: Arc::new(NoopQueryParser::new()),
-            }),
+            handler: Arc::new(TursoPgHandler::new(self.conn.clone(), self.db_file.clone())),
         });
 
         loop {
@@ -108,6 +104,14 @@ struct TursoPgHandler {
 }
 
 impl TursoPgHandler {
+    fn new(conn: Arc<Mutex<PgConnection>>, db_file: String) -> Self {
+        Self {
+            conn,
+            db_file,
+            query_parser: Arc::new(NoopQueryParser::new()),
+        }
+    }
+
     /// After a DROP SCHEMA query succeeds, delete the schema's database file.
     /// Uses simple string matching to detect DROP SCHEMA statements.
     fn cleanup_dropped_schema_file(&self, query: &str) {
@@ -232,7 +236,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         // Clean up schema file after successful DROP SCHEMA
         self.cleanup_dropped_schema_file(query);
 
-        // Bind parameters from the portal
+        // Bind parameters from the portal (uses client-declared formats)
         bind_portal_parameters(&mut stmt, portal)?;
 
         if stmt.num_columns() == 0 || is_pg_non_query(query) {
@@ -256,6 +260,10 @@ impl ExtendedQueryHandler for TursoPgHandler {
             .prepare(&target.statement)
             .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
 
+        // Report the parameter types the client declared in the Parse message.
+        // PostgreSQL requires Describe to echo these; when the client did not
+        // specify a type we report TEXT, which is what psql/ORMs expect for
+        // unspecified parameters.
         let param_types: Vec<Type> = target
             .parameter_types
             .iter()
@@ -420,9 +428,12 @@ fn execute_non_query(stmt: &mut turso_core::Statement, query: &str) -> PgWireRes
 /// Extract parameters from a Portal and bind them to a prepared statement.
 ///
 /// PostgreSQL parameters ($1, $2, ...) map to portal parameters 0, 1, ...
-/// The bytecode compiler may allocate internal parameter indices in a different
-/// order than the $N numbering (e.g. if $2 appears before $1 in the SQL), so we
-/// look up each parameter's internal index by name.
+///
+/// Decoding follows the wire contract: a parameter sent in binary format is
+/// decoded by its declared PostgreSQL type (`pg_bytes_to_value`), while a
+/// parameter sent in text format is decoded as text and left to SQLite's own
+/// type affinity. This relies only on the client-declared formats from the
+/// Bind message — no inference from the SQL text is performed.
 fn bind_portal_parameters(
     stmt: &mut turso_core::Statement,
     portal: &Portal<String>,
@@ -431,13 +442,22 @@ fn bind_portal_parameters(
         let value = match &portal.parameters[i] {
             None => Value::Null,
             Some(bytes) => {
-                let pg_type = portal
-                    .statement
-                    .parameter_types
-                    .get(i)
-                    .and_then(|t| t.as_ref())
-                    .unwrap_or(&Type::UNKNOWN);
-                pg_bytes_to_value(bytes, pg_type)?
+                let binary = portal.parameter_format.is_binary(i);
+                if binary {
+                    // Client declared a type via the Parse message; trust it.
+                    let pg_type = portal
+                        .statement
+                        .parameter_types
+                        .get(i)
+                        .cloned()
+                        .flatten()
+                        .unwrap_or(Type::UNKNOWN);
+                    pg_bytes_to_value(bytes, &pg_type)?
+                } else {
+                    // Text format: decode as text and let SQLite affinity handle
+                    // the rest. `pg_bytes_to_value` falls through to text here.
+                    pg_bytes_to_value(bytes, &Type::UNKNOWN)?
+                }
             }
         };
         // Portal parameter i corresponds to PostgreSQL $N where N = i + 1.
@@ -454,9 +474,50 @@ fn bind_portal_parameters(
     Ok(())
 }
 
-/// Convert raw parameter bytes to a turso Value based on the PostgreSQL type.
-/// Assumes text format encoding (UTF-8 string representations).
 fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
+    let is_binary = *pg_type != Type::UNKNOWN;
+    match *pg_type {
+        Type::INT2 if bytes.len() == 2 => {
+            return Ok(Value::from_i64(
+                i16::from_be_bytes(bytes.try_into().unwrap()) as i64,
+            ));
+        }
+        Type::INT4 if bytes.len() == 4 => {
+            return Ok(Value::from_i64(
+                i32::from_be_bytes(bytes.try_into().unwrap()) as i64,
+            ));
+        }
+        Type::INT8 if bytes.len() == 8 => {
+            return Ok(Value::from_i64(i64::from_be_bytes(
+                bytes.try_into().unwrap(),
+            )));
+        }
+        Type::FLOAT4 if bytes.len() == 4 => {
+            return Ok(Value::from_f64(
+                f32::from_be_bytes(bytes.try_into().unwrap()) as f64,
+            ));
+        }
+        Type::FLOAT8 if bytes.len() == 8 => {
+            return Ok(Value::from_f64(f64::from_be_bytes(
+                bytes.try_into().unwrap(),
+            )));
+        }
+        Type::BOOL if bytes.len() == 1 => {
+            return Ok(Value::from_i64(bytes[0] as i64));
+        }
+        // A binary-format parameter whose declared type has no binary decoder
+        // here, or whose byte length contradicts the declaration, cannot be
+        // interpreted — the bytes are not text. PostgreSQL rejects these with
+        // `incorrect binary data format`; decode as text only for text-format
+        // parameters (callers pass UNKNOWN for those).
+        _ if is_binary => {
+            return Err(PgWireError::UserError(Box::new(error_info(
+                "incorrect binary data format",
+            ))));
+        }
+        _ => {}
+    }
+
     let text = std::str::from_utf8(bytes).map_err(|e| {
         PgWireError::UserError(Box::new(error_info(&format!(
             "invalid UTF-8 in parameter: {e}"
@@ -545,10 +606,17 @@ fn encode_value(
             .encode_field(&None::<i8>)
             .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
         Value::Numeric(turso_core::Numeric::Integer(i)) => {
-            // Boolean columns: encode as true/false instead of 0/1
             if *pg_type == Type::BOOL {
                 encoder
                     .encode_field(&(*i != 0))
+                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+            } else if *pg_type == Type::INT4 {
+                encoder
+                    .encode_field(&(*i as i32))
+                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+            } else if *pg_type == Type::INT2 {
+                encoder
+                    .encode_field(&(*i as i16))
                     .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
             } else {
                 encoder
