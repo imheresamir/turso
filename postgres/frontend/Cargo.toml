@@ -17,6 +17,7 @@ rustc-hash = "2.0"
 tempfile = { workspace = true }
 turso_core = { workspace = true, default-features = true, features = [
     "conn_raw_api",
+    "pg_compat",
 ] }
 turso_parser = { workspace = true }
 turso_ext = { workspace = true, features = ["core_only"] }

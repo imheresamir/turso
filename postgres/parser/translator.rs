@@ -2350,8 +2350,21 @@ impl PostgreSQLTranslator {
                         | SqlValueFunctionOp::SvfopUser
                         | SqlValueFunctionOp::SvfopCurrentRole,
                     ) => {
-                        // Return empty string stub for user functions
-                        Ok(ast::Expr::Literal(ast::Literal::String("''".into())))
+                        // Route the role pseudo-functions through the frontend
+                        // `current_user` scalar so all four spellings share one
+                        // implementation and agree with pg_catalog. The frontend
+                        // resolves them to the well-known "turso" role.
+                        Ok(ast::Expr::FunctionCall {
+                            name: ast::Name::from_string("current_user"),
+                            distinctness: None,
+                            args: vec![],
+                            order_by: vec![],
+                            within_group: vec![],
+                            filter_over: ast::FunctionTail {
+                                filter_clause: None,
+                                over_clause: None,
+                            },
+                        })
                     }
                     // The bare keywords route through the frontend scalars so both
                     // syntaxes share one implementation and agree with pg_catalog.

@@ -3554,3 +3554,29 @@ fn test_postgres_sqlite_dialect_table_name_column_collision_not_ambiguous(db: Te
     // SQLite resolves `a` to b.a here (the only real column named `a`), → 222.
     assert_eq!(*value, 222);
 }
+
+/// The single-column alias rule still applies under the PostgreSQL dialect:
+/// `unnest(arr) AS x` exposes the element via the alias `x`.
+#[turso_macros::test]
+fn test_postgres_single_column_alias_exposes_column(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    let mut rows = conn
+        .query("SELECT x FROM unnest(ARRAY[10, 20]) AS x")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected first row");
+    };
+    let Value::Numeric(Numeric::Integer(v)) = rows.row().unwrap().get_value(0) else {
+        panic!("expected integer");
+    };
+    assert_eq!(*v, 10);
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected second row");
+    };
+    let Value::Numeric(Numeric::Integer(v)) = rows.row().unwrap().get_value(0) else {
+        panic!("expected integer");
+    };
+    assert_eq!(*v, 20);
+}

@@ -188,3 +188,82 @@ fn test_pg_description_stubs_return_null(db: TempDatabase) {
         assert_eq!(query_text(&conn, sql), ["NULL"], "{sql}");
     }
 }
+
+#[turso_macros::test(mvcc)]
+fn test_txid_current_is_per_connection_and_monotonic(db: TempDatabase) {
+    // Each connection mints its own strictly-increasing, non-zero xid. Two
+    // independent connections must not share a counter, and each must start
+    // at 1 and increment by 1 on successive calls.
+    let conn_a = db.connect_postgres();
+    let conn_b = db.connect_postgres();
+
+    let a1 = query_integer(&conn_a, "SELECT txid_current()")[0];
+    let a2 = query_integer(&conn_a, "SELECT txid_current()")[0];
+    let b1 = query_integer(&conn_b, "SELECT txid_current()")[0];
+
+    assert_eq!(a1, 1, "first txid on a fresh connection must be 1");
+    assert_eq!(
+        a2, 2,
+        "txid must increment on each call within a connection"
+    );
+    assert_eq!(
+        b1, 1,
+        "a second connection must have its own counter starting at 1"
+    );
+}
+
+// `current_setting` must report the modeled GUCs and remain stable across
+// repeated calls / variants (case-insensitive name, default fallback).
+#[turso_macros::test(mvcc)]
+fn test_pg_current_setting_variants(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    let cases = [
+        ("search_path", "public"),
+        ("TimeZone", "UTC"),
+        ("SERVER_ENCODING", "UTF8"),
+        ("client_encoding", "UTF8"),
+        ("DateStyle", "ISO, MDY"),
+        ("standard_conforming_strings", "on"),
+        ("integer_datetimes", "on"),
+    ];
+    for (name, expected) in cases {
+        assert_eq!(
+            query_text(&conn, &format!("SELECT current_setting('{name}')")),
+            [expected.to_string()],
+            "{name}"
+        );
+    }
+
+    // Unknown setting returns empty text, not an error.
+    assert_eq!(
+        query_text(&conn, "SELECT current_setting('no_such_guc')"),
+        [String::new()]
+    );
+
+    // Repeated call is stable.
+    assert_eq!(
+        query_text(&conn, "SELECT current_setting('timezone')"),
+        ["UTC"]
+    );
+}
+
+// `count(*)` is pinned to INT8 (PostgreSQL's count is bigint). This is the
+// commit's only unconditional core type-inference change; lock it so a future
+// refactor cannot silently flip it back to the affinity-derived TEXT fallback.
+#[turso_macros::test(mvcc)]
+fn test_pg_count_star_reports_int8(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (id integer)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+
+    let stmt = conn.prepare("SELECT count(*) FROM t").unwrap();
+    let info = stmt
+        .get_column_type_info(0)
+        .expect("column type info")
+        .expect("type info present");
+    assert_eq!(
+        info.declared_name, "INT8",
+        "count(*) must infer INT8, got {info:?}"
+    );
+}

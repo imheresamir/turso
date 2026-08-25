@@ -3,11 +3,67 @@ use turso_core::schema::{Schema, Table};
 use turso_core::{Connection, LimboError, Result, Value};
 use turso_parser::ast::RefAct;
 
+use crate::compat_state::compat_state;
+
 const USER_TABLE_OID_START: i64 = 16384;
+
+/// Captured once at library load: the process start time, used by
+/// `pg_postmaster_start_time()`.
+static PROCESS_START_TIME: std::sync::OnceLock<std::time::SystemTime> = std::sync::OnceLock::new();
+
+fn process_start_time() -> std::time::SystemTime {
+    *PROCESS_START_TIME.get_or_init(std::time::SystemTime::now)
+}
+
+/// Every scalar this frontend resolves, shared by [`resolve_scalar`] and the
+/// `information_schema.routines` view so the two cannot drift.
+pub(crate) const SCALAR_FUNCTIONS: &[&str] = &[
+    "pg_get_userbyid",
+    "pg_table_is_visible",
+    "pg_function_is_visible",
+    "pg_type_is_visible",
+    "pg_encoding_to_char",
+    "pg_get_function_result",
+    "pg_get_function_arguments",
+    "pg_get_statisticsobjdef_columns",
+    "pg_relation_is_publishable",
+    "quote_ident",
+    "quote_literal",
+    "format_type",
+    "pg_get_constraintdef",
+    "pg_get_indexdef",
+    "obj_description",
+    "pg_get_expr",
+    "to_char",
+    "pg_input_is_valid",
+    "booleq",
+    "boolne",
+    "col_description",
+    "version",
+    "current_database",
+    "current_schema",
+    "current_user",
+    "session_user",
+    "user",
+    "current_role",
+    "current_setting",
+    "current_schemas",
+    "txid_current",
+    "pg_postmaster_start_time",
+    "pg_backend_pid",
+    "pg_size_pretty",
+    "pg_table_size",
+    "pg_relation_size",
+    "pg_total_relation_size",
+    "pg_indexes_size",
+];
 
 /// Resolve a PostgreSQL scalar function by name and argument count. Entry
 /// point for [`crate::catalog::PostgresDialect::resolve_function`].
 pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
+    if !SCALAR_FUNCTIONS.contains(&name) {
+        return false;
+    }
     let arities: &[i64] = match name {
         "pg_get_userbyid"
         | "pg_table_is_visible"
@@ -24,6 +80,13 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         "pg_get_expr" => &[2, 3],
         "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" => &[2],
         "version" | "current_database" | "current_schema" | "pg_backend_pid" => &[0],
+        "current_user" | "session_user" | "user" | "current_role" => &[0],
+        "current_setting" => &[1, 2],
+        "current_schemas" => &[1],
+        "txid_current" => &[0],
+        "pg_postmaster_start_time" => &[0],
+        "pg_size_pretty" => &[1],
+        "pg_table_size" | "pg_relation_size" | "pg_total_relation_size" | "pg_indexes_size" => &[1],
         _ => return false,
     };
     arities.contains(&(arg_count as i64))
@@ -63,7 +126,17 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         // pg_catalog presents every user object under the hardcoded "public"
         // namespace, so that is always the current schema.
         "current_schema" => Ok(Value::build_text("public")),
+        "current_user" | "session_user" | "user" | "current_role" => Ok(exec_current_user(conn)),
         "pg_backend_pid" => Ok(Value::from_i64(std::process::id() as i64)),
+        "current_setting" => Ok(exec_current_setting(conn, text_arg(0))),
+        "current_schemas" => Ok(exec_current_schemas(conn, int_arg(0, 0) != 0)),
+        "txid_current" => Ok(exec_txid_current(conn)),
+        "pg_postmaster_start_time" => Ok(exec_pg_postmaster_start_time()),
+        "pg_size_pretty" => Ok(exec_pg_size_pretty(int_arg(0, 0))),
+        "pg_table_size" | "pg_relation_size" | "pg_total_relation_size" => {
+            Ok(exec_pg_relation_size(conn, &text_arg(0)))
+        }
+        "pg_indexes_size" => Ok(exec_pg_indexes_size(conn, &text_arg(0))),
         "quote_ident" => match args.first() {
             Some(Value::Null) | None => Ok(Value::Null),
             _ => Ok(Value::build_text(turso_pg_parser::quote_identifier(
@@ -88,7 +161,130 @@ fn exec_pg_get_user_by_id(_oid: i64) -> Value {
     Value::build_text("turso")
 }
 
+/// Return the superuser role this frontend presents. Every object is exposed
+/// under `turso`, so `current_user` / `session_user` / `user` / `current_role`
+/// all agree with `pg_roles` / `pg_get_userbyid`. (Role-aware auth would be set
+/// by an embedding application; this frontend ships with a single well-known
+/// role and intentionally does not guess one.)
+fn exec_current_user(_conn: &Connection) -> Value {
+    Value::build_text("turso")
+}
+
+fn exec_current_setting(_conn: &Connection, name: String) -> Value {
+    // Minimal GUC store for the settings clients probe most. Unknown settings
+    // return empty text rather than erroring, so ORMs that query a setting we
+    // don't model still get a value. search_path is the hardcoded "public"
+    // namespace this frontend presents (see current_schema).
+    let value = match name.to_ascii_lowercase().as_str() {
+        "search_path" => "public".to_string(),
+        "timezone" => "UTC".to_string(),
+        "server_encoding" => "UTF8".to_string(),
+        "client_encoding" => "UTF8".to_string(),
+        "datestyle" => "ISO, MDY".to_string(),
+        "intervalstyle" => "postgres".to_string(),
+        "standard_conforming_strings" => "on".to_string(),
+        "integer_datetimes" => "on".to_string(),
+        "application_name" => String::new(),
+        "client_min_messages" => "notice".to_string(),
+        "lc_collate" => "en_US.UTF-8".to_string(),
+        "lc_ctype" => "en_US.UTF-8".to_string(),
+        "is_superuser" => "off".to_string(),
+        "transaction_isolation" => "read committed".to_string(),
+        _ => String::new(),
+    };
+    Value::build_text(value)
+}
+
+fn exec_current_schemas(_conn: &Connection, _include_implicit: bool) -> Value {
+    // Value has no array variant; return the Postgres array literal form so
+    // consumers that stringify it (psql, ORMs) see the expected shape. The
+    // frontend presents a single hardcoded "public" namespace.
+    Value::build_text("{\"public\"}")
+}
+
+fn exec_txid_current(conn: &Connection) -> Value {
+    // Mint a per-connection, strictly-increasing, non-zero xid (mirrors
+    // PostgreSQL's monotonic xid shape). This is per-session, so concurrent
+    // connections report independent sequences rather than a shared global
+    // counter.
+    Value::from_i64(conn.next_pg_txid())
+}
+
+/// Return the on-disk byte size of the named relation.
+///
+/// Turso stores every relation in a single database file (user tables in the
+/// main db; PG schemas as separate attached databases). A per-relation byte
+/// size is not a native SQLite concept in the single-file model, so — like
+/// other PG-compat shims — this approximates by returning the size of the
+/// underlying database file. This is the value psql's `\dt+` surfaces as the
+/// relation "Size"; any positive integer unblocks the command.
+///
+/// `name` is the regclass text (e.g. `'t'`); a relation that does not exist
+/// returns 0 rather than a fabricated positive size. An embedder may register
+/// a narrower hook via `PgConnection::set_relation_size_fn`.
+fn exec_pg_relation_size(conn: &Connection, name: &str) -> Value {
+    if !relation_exists(conn, name) {
+        return Value::from_i64(0);
+    }
+    Value::from_i64(compat_state(conn).relation_size())
+}
+
+/// Total size of a relation: table data plus its associated indexes/toast.
+/// In the single-file model this equals the database file size (name ignored
+/// beyond the existence check).
+fn exec_pg_indexes_size(conn: &Connection, name: &str) -> Value {
+    if !relation_exists(conn, name) {
+        return Value::from_i64(0);
+    }
+    Value::from_i64(compat_state(conn).relation_size())
+}
+
+/// Whether `name` resolves to a table/view in the current schema. Used to
+/// avoid reporting a fabricated size for a nonexistent relation.
+fn relation_exists(conn: &Connection, name: &str) -> bool {
+    let name = name.trim().trim_matches('"');
+    if name.is_empty() {
+        return false;
+    }
+    let schema = conn.current_schema();
+    schema.get_table(name).is_some() || schema.get_view(name).is_some()
+}
+
+fn exec_pg_postmaster_start_time() -> Value {
+    let start = process_start_time();
+    let secs = start
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).unwrap_or_default();
+    Value::build_text(dt.format("%Y-%m-%d %H:%M:%S%:z").to_string())
+}
+
+fn exec_pg_size_pretty(bytes: i64) -> Value {
+    if bytes < 1024 {
+        return Value::build_text(format!("{bytes} bytes"));
+    }
+    const UNITS: &[&str] = &["kB", "MB", "GB", "TB", "PB", "EB"];
+    let mut size = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    let text = if size >= 10.0 || size == size.trunc() {
+        format!("{} {}", size as i64, UNITS[unit])
+    } else if size >= 1.0 {
+        format!("{size:.1} {}", UNITS[unit])
+    } else {
+        format!("{size:.2} {}", UNITS[unit])
+    };
+    Value::build_text(text)
+}
+
 fn exec_pg_is_visible(_oid: i64) -> Value {
+    // The compat layer presents every object in a single namespace, so all
+    // relations are visible to the current session (mirrors the single
+    // `public`/`turso` schema model used elsewhere in this frontend).
     Value::from_i64(1)
 }
 

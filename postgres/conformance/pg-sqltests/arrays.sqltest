@@ -1,0 +1,34 @@
+# Array expressions through the PostgreSQL frontend.
+#
+# Coverage here asserts behavior that real PostgreSQL also exhibits, so the
+# corpus stays valid for future differential runs against a stock server.
+# Known divergence: unnest over an EMPTY array yields one NULL row (PostgreSQL
+# yields zero rows) — pinned below so a future fix cannot regress it silently.
+
+@database :memory:
+
+test unnest-expands-array-literal {
+    SELECT unnest(ARRAY[1, 2, 3]) ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+}
+
+test array-subquery-aggregates-first-column {
+    CREATE TABLE t (id int);
+    INSERT INTO t VALUES (10), (20), (30);
+    SELECT array(SELECT id FROM t WHERE id < 30);
+}
+expect {
+    {10,20}
+}
+
+# Empty array currently yields a single NULL row, so count(*) sees one row.
+test unnest-empty-array-yields-single-null-row {
+    SELECT count(*) FROM unnest(ARRAY[]::int[]);
+}
+expect {
+    1
+}
