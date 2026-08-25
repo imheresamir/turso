@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::num::NonZero;
 use std::str;
 use std::sync::{Arc, Mutex};
@@ -8,8 +9,10 @@ use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Valu
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
     is_comment_on, is_refresh_matview, try_extract_copy_from, try_extract_create_schema,
-    try_extract_drop_schema, try_extract_set, try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt,
-    PgDropSchemaStmt, PgSetStmt, PostgreSQLTranslator,
+    try_extract_deallocate, try_extract_drop_schema, try_extract_execute, try_extract_explain,
+    try_extract_prepare, try_extract_set, try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt,
+    PgDeallocateStmt, PgDropSchemaStmt, PgExplainStmt, PgPrepareStmt, PgSetStmt,
+    PostgreSQLTranslator,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -17,6 +20,15 @@ use crate::copy::parse_copy_text_format;
 #[derive(Clone)]
 pub struct PgConnection {
     inner: Arc<PgConnectionInner>,
+}
+
+impl PgConnection {
+    /// Register a closure reporting the backing database file's on-disk byte size.
+    /// The PostgreSQL compat layer uses this for `pg_table_size` and friends,
+    /// which have no per-relation size in the single-file model.
+    pub fn set_relation_size_fn(&self, f: Arc<dyn Fn() -> i64 + Send + Sync>) {
+        crate::compat_state::compat_state(&self.inner.conn).set_relation_size_fn(f);
+    }
 }
 
 struct PgConnectionInner {
@@ -31,9 +43,18 @@ impl PgConnectionInner {
     }
 }
 
+impl Drop for PgConnectionInner {
+    fn drop(&mut self) {
+        // Free the frontend compat state keyed by this core connection so the
+        // global side-table does not leak an entry per connection.
+        crate::compat_state::drop_compat_state(&self.conn);
+    }
+}
+
 #[derive(Default)]
 struct SessionState {
     search_path: Vec<String>,
+    prepared: HashMap<String, String>,
 }
 
 /// Open a database with the PostgreSQL schema dialect, resolving the IO
@@ -203,9 +224,14 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         stmt.run_ignore_rows()?;
     }
 
+    let mut stmt = match &translated.cmd {
+        ast::Cmd::Stmt(stmt) => stmt.clone(),
+        other => return Err(LimboError::ParseError(format!("cannot prepare {other:?}"))),
+    };
+    crate::srf::rewrite_stmt(&pg_conn.conn, &mut stmt);
     pg_conn
         .conn
-        .prepare_translated_cmd_with_options(translated.cmd, sql, &options)
+        .prepare_translated_stmt_with_options(stmt, sql, &options)
 }
 
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
@@ -288,11 +314,79 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
         return Ok(Some(stmt));
     }
 
+    if let Some(stmt) =
+        try_extract_explain(&parse_result).map_err(|e| LimboError::ParseError(e.to_string()))?
+    {
+        let inner = prepare_explained_stmt(pg_conn, &stmt)?;
+        return Ok(Some(inner));
+    }
+
+    if let Some(stmt) = try_extract_prepare(&parse_result) {
+        handle_pg_prepare(pg_conn, &stmt)?;
+        return Ok(Some(noop_statement(&pg_conn.conn)?));
+    }
+
+    if let Some(stmt) =
+        try_extract_execute(&parse_result).map_err(|e| LimboError::ParseError(e.to_string()))?
+    {
+        let mut prepared = prepare_statement(pg_conn, &lookup_prepared(pg_conn, &stmt.name)?)?;
+        bind_executed_params(&mut prepared, &stmt.params)?;
+        return Ok(Some(prepared));
+    }
+
+    if let Some(stmt) = try_extract_deallocate(&parse_result) {
+        handle_pg_deallocate(pg_conn, &stmt)?;
+        return Ok(Some(noop_statement(&pg_conn.conn)?));
+    }
+
     Ok(None)
 }
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
     conn.prepare("SELECT 0 WHERE 0")
+}
+
+fn prepare_explained_stmt(
+    pg_conn: &Arc<PgConnectionInner>,
+    explain: &PgExplainStmt,
+) -> Result<Statement> {
+    let sql = explain.query.trim();
+    reject_sqlite_catalog_access(sql)?;
+
+    let parse_result =
+        turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    let translator = PostgreSQLTranslator::new();
+    let translated = translator
+        .translate_with_prereqs(&parse_result)
+        .map_err(|e| LimboError::ParseError(e.to_string()))?;
+    let stmt = match &translated.cmd {
+        ast::Cmd::Stmt(stmt) => stmt.clone(),
+        other => return Err(LimboError::ParseError(format!("cannot EXPLAIN {other:?}"))),
+    };
+    reject_catalog_dml(&stmt)?;
+
+    let options = {
+        let state = pg_conn.session_state.lock().unwrap();
+        let path = state.search_path.clone();
+        PrepareOptions {
+            unqualified_database_search_path: if path.is_empty() { None } else { Some(path) },
+        }
+    };
+    for prereq in translated.prereqs {
+        let input = prereq.to_string();
+        let mut stmt = pg_conn
+            .conn
+            .prepare_translated_stmt_with_options(prereq, &input, &options)?;
+        stmt.run_ignore_rows()?;
+    }
+
+    let cmd = ast::Cmd::ExplainQueryPlan {
+        stmt,
+        format: ast::EqpFormat::Text,
+    };
+    pg_conn
+        .conn
+        .prepare_translated_cmd_with_options(cmd, sql, &options)
 }
 
 fn execute_sqlite_internal(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
@@ -316,6 +410,66 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
     })?;
     let pragma_sql = format!("PRAGMA {} = {}", set_stmt.name, value.to_sql_string());
     pg_conn.conn.prepare(&pragma_sql)
+}
+
+fn handle_pg_prepare(pg_conn: &Arc<PgConnectionInner>, stmt: &PgPrepareStmt) -> Result<()> {
+    let mut state = pg_conn.session_state.lock().unwrap();
+    state.prepared.insert(stmt.name.clone(), stmt.query.clone());
+    Ok(())
+}
+
+fn lookup_prepared(pg_conn: &Arc<PgConnectionInner>, name: &str) -> Result<String> {
+    let state = pg_conn.session_state.lock().unwrap();
+    state.prepared.get(name).cloned().ok_or_else(|| {
+        LimboError::ParseError(format!("prepared statement \"{name}\" does not exist"))
+    })
+}
+
+fn handle_pg_deallocate(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDeallocateStmt) -> Result<()> {
+    let mut state = pg_conn.session_state.lock().unwrap();
+    match &stmt.name {
+        Some(name) => {
+            state.prepared.remove(name);
+        }
+        None => state.prepared.clear(),
+    }
+    Ok(())
+}
+
+fn bind_executed_params(stmt: &mut Statement, params: &[String]) -> Result<()> {
+    for (i, raw) in params.iter().enumerate() {
+        let value = literal_to_value(raw);
+        let pg_param_name = format!("${}", i + 1);
+        let idx = stmt
+            .parameter_index(&pg_param_name)
+            .unwrap_or_else(|| NonZero::new(i + 1).expect("parameter index must be non-zero"));
+        stmt.bind_at(idx, value)?;
+    }
+    Ok(())
+}
+
+fn literal_to_value(raw: &str) -> Value {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("NULL") {
+        return Value::Null;
+    }
+    if trimmed.eq_ignore_ascii_case("true") {
+        return Value::from_i64(1);
+    }
+    if trimmed.eq_ignore_ascii_case("false") {
+        return Value::from_i64(0);
+    }
+    if trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2 {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        return Value::Text(inner.replace("''", "'").into());
+    }
+    if let Ok(i) = trimmed.parse::<i64>() {
+        return Value::from_i64(i);
+    }
+    if let Ok(f) = trimmed.parse::<f64>() {
+        return Value::from_f64(f);
+    }
+    Value::Text(trimmed.to_string().into())
 }
 
 fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) -> Result<()> {

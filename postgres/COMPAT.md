@@ -91,7 +91,7 @@ implemented.
 | Custom background workers | ❌ Not supported | |
 | Disk based FSM | ❌ Not supported | |
 | Dynamic Background Workers | ❌ Not supported | |
-| EXPLAIN (BUFFERS) support | ❌ Not supported | EXPLAIN is not supported at all |
+| EXPLAIN (BUFFERS) support | ❌ Not supported | `EXPLAIN` and `EXPLAIN ANALYZE` both show the query plan; neither executes the statement (rows are not inserted/updated/deleted), unlike PostgreSQL where ANALYZE runs it. All other EXPLAIN options are rejected. BUFFERS is not supported |
 | EXPLAIN (MEMORY) | ❌ Not supported | |
 | EXPLAIN (SERIALIZE) support | ❌ Not supported | |
 | EXPLAIN (WAL) support | ❌ Not supported | |
@@ -102,7 +102,7 @@ implemented.
 | pg_stat_io - I/O metrics view | ❌ Not supported | |
 | pg_wait_events system view | ❌ Not supported | |
 | Server statistics in shared memory | ❌ Not supported | |
-| SQL-standard information schema | ❌ Not supported | Only an `information_schema` row in pg_namespace; no views |
+| SQL-standard information schema | 🟡 Partial | `tables`, `columns`, `schemata`, `routines` and `table_constraints` views are provided. The registry registers them under unqualified names, so a user table named `columns` or `tables` collides (same class as the pre-existing `CREATE TABLE pg_class` shadowing) |
 | Support for anonymous shared memory | ❌ Not supported | |
 | XML, JSON and YAML output for EXPLAIN | ❌ Not supported | |
 
@@ -193,7 +193,7 @@ INTEGER. Unknown type names pass through as custom types.
 | SYSTEM_USER | ❌ Not supported | current_user/current_role return stub values |
 | TABLE statement | ✅ Supported | |
 | Underscores (_) for thousands separators | ✅ Supported | |
-| unnest/array_agg | 🟡 Partial | array_agg works; unnest is not implemented |
+| unnest/array_agg | 🟡 Partial | array_agg and single-array unnest work; unnest over an EMPTY array yields one NULL row instead of zero rows; multi-array unnest is not implemented |
 | Upsert (INSERT ... ON CONFLICT DO ...) | ✅ Supported | DO NOTHING and DO UPDATE SET ... (with EXCLUDED and conflict targets) |
 | Window functions | 🟡 Partial | Aggregate window functions (COUNT/SUM/AVG/MIN/MAX OVER), row_number, PARTITION BY/ORDER BY, frame clauses, and named WINDOW clauses work; rank, dense_rank, lag, lead, etc. are not implemented |
 | WITHIN GROUP clause | ❌ Not supported | Silently dropped; ordered-set aggregates (percentile_cont) missing |

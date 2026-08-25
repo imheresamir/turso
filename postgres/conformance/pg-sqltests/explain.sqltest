@@ -1,7 +1,8 @@
 # EXPLAIN through the PostgreSQL frontend.
 #
-# Simple EXPLAIN is intentionally mapped to SQLite's EXPLAIN QUERY PLAN.
-# PostgreSQL EXPLAIN options are rejected until their output semantics exist.
+# Both plain EXPLAIN and EXPLAIN ANALYZE are mapped to SQLite's
+# EXPLAIN QUERY PLAN and neither executes the statement. All other PostgreSQL
+# EXPLAIN options are rejected until their output semantics exist.
 
 @database :memory:
 
@@ -59,10 +60,12 @@ expect {
     1|0|0|SCAN CONSTANT ROW
 }
 
-test explain-analyze-errors {
+test explain-analyze-shows-plan-without-executing {
     EXPLAIN ANALYZE SELECT 1;
 }
-expect error {}
+expect {
+    1|0|0|SCAN CONSTANT ROW
+}
 
 test explain-options-error {
     EXPLAIN (VERBOSE) SELECT 1;

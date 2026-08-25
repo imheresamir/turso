@@ -23,6 +23,10 @@ impl Dialect for PostgresDialect {
         "postgres"
     }
 
+    fn exposes_single_column_alias(&self) -> bool {
+        true
+    }
+
     fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
         // Engine-generated helper statements and pragmas are canonical SQLite
         // text that pg_query rejects, so anything the PostgreSQL parser cannot
@@ -738,7 +742,8 @@ impl InternalVirtualTable for PgAttributeTable {
             attacl TEXT,
             attoptions TEXT,
             attfdwoptions TEXT,
-            attmissingval TEXT
+            attmissingval TEXT,
+            attcompression TEXT
         )"
         .to_string()
     }
@@ -803,6 +808,7 @@ impl PgAttributeCursor {
                     Value::Null,                  // attoptions
                     Value::Null,                  // attfdwoptions
                     Value::Null,                  // attmissingval
+                    Value::Text("p".into()),      // attcompression (plain)
                 ]);
             }
         }
@@ -2001,37 +2007,37 @@ impl PgTypeCursor {
     fn make_type_row(t: &PgTypeInfo) -> Vec<Value> {
         vec![
             Value::from_i64(t.oid),                 // oid
-            Value::build_text(t.name),              // typname
-            Value::from_i64(11),                    // typnamespace (pg_catalog)
-            Value::from_i64(10),                    // typowner
-            Value::from_i64(t.typlen),              // typlen
+            Value::build_text(t.name), // typname (internal name, e.g. "int4", matching PostgreSQL)
+            Value::from_i64(11),       // typnamespace (pg_catalog)
+            Value::from_i64(10),       // typowner
+            Value::from_i64(t.typlen), // typlen
             Value::from_i64(i64::from(t.typbyval)), // typbyval
-            Value::build_text(t.typtype),           // typtype
-            Value::build_text(t.typcategory),       // typcategory
-            Value::from_i64(0),                     // typispreferred
-            Value::from_i64(1),                     // typisdefined
-            Value::build_text(","),                 // typdelim
-            Value::from_i64(0),                     // typrelid
-            Value::Null,                            // typsubscript
-            Value::from_i64(t.typelem),             // typelem
-            Value::from_i64(t.typarray),            // typarray
-            Value::Null,                            // typinput
-            Value::Null,                            // typoutput
-            Value::Null,                            // typreceive
-            Value::Null,                            // typsend
-            Value::Null,                            // typmodin
-            Value::Null,                            // typmodout
-            Value::Null,                            // typanalyze
-            Value::build_text(t.typalign),          // typalign
-            Value::build_text(t.typstorage),        // typstorage
-            Value::from_i64(0),                     // typnotnull
-            Value::from_i64(0),                     // typbasetype
-            Value::from_i64(-1),                    // typtypmod
-            Value::from_i64(0),                     // typndims
-            Value::from_i64(0),                     // typcollation
-            Value::Null,                            // typdefaultbin
-            Value::Null,                            // typdefault
-            Value::Null,                            // typacl
+            Value::build_text(t.typtype), // typtype
+            Value::build_text(t.typcategory), // typcategory
+            Value::from_i64(0),        // typispreferred
+            Value::from_i64(1),        // typisdefined
+            Value::build_text(","),    // typdelim
+            Value::from_i64(0),        // typrelid
+            Value::Null,               // typsubscript
+            Value::from_i64(t.typelem), // typelem
+            Value::from_i64(t.typarray), // typarray
+            Value::Null,               // typinput
+            Value::Null,               // typoutput
+            Value::Null,               // typreceive
+            Value::Null,               // typsend
+            Value::Null,               // typmodin
+            Value::Null,               // typmodout
+            Value::Null,               // typanalyze
+            Value::build_text(t.typalign), // typalign
+            Value::build_text(t.typstorage), // typstorage
+            Value::from_i64(0),        // typnotnull
+            Value::from_i64(0),        // typbasetype
+            Value::from_i64(-1),       // typtypmod
+            Value::from_i64(0),        // typndims
+            Value::from_i64(0),        // typcollation
+            Value::Null,               // typdefaultbin
+            Value::Null,               // typdefault
+            Value::Null,               // typacl
         ]
     }
 
@@ -3101,6 +3107,29 @@ pub fn pg_catalog_virtual_tables() -> Vec<Arc<VirtualTable>> {
             )
             .expect("pg_input_error_info virtual table creation should not fail"),
         ),
+        // pg_partition_ancestors table-valued function (always empty: no partitioning)
+        Arc::new(
+            VirtualTable::new_internal(
+                "pg_partition_ancestors".to_string(),
+                PgPartitionAncestorsTable::new().sql(),
+                VTabKind::VirtualTable,
+                Arc::new(RwLock::new(PgPartitionAncestorsTable::new())),
+            )
+            .expect("pg_partition_ancestors virtual table creation should not fail"),
+        ),
+        // unnest(array) table-valued function: expands a single array column into
+        // one row per element. psql's \d+ reloptions line uses
+        // `unnest(tc.reloptions)`; the array arrives as the function's hidden
+        // argument (a Value::Blob recording the elements in record format).
+        Arc::new(
+            VirtualTable::new_internal(
+                "unnest".to_string(),
+                UnnestTable::new().sql(),
+                VTabKind::VirtualTable,
+                Arc::new(RwLock::new(UnnestTable::new())),
+            )
+            .expect("unnest virtual table creation should not fail"),
+        ),
         // pg_sequences virtual table
         Arc::new(
             VirtualTable::new_internal(
@@ -3110,6 +3139,52 @@ pub fn pg_catalog_virtual_tables() -> Vec<Arc<VirtualTable>> {
                 Arc::new(RwLock::new(PgSequencesTable::new())),
             )
             .expect("pg_sequences virtual table creation should not fail"),
+        ),
+        // information_schema views (PostgreSQL-standard introspection surface)
+        Arc::new(
+            VirtualTable::new_internal(
+                "tables".to_string(),
+                InfoSchemaTablesTable::new().sql(),
+                VTabKind::VirtualTable,
+                Arc::new(RwLock::new(InfoSchemaTablesTable::new())),
+            )
+            .expect("information_schema.tables virtual table creation should not fail"),
+        ),
+        Arc::new(
+            VirtualTable::new_internal(
+                "columns".to_string(),
+                InfoSchemaColumnsTable::new().sql(),
+                VTabKind::VirtualTable,
+                Arc::new(RwLock::new(InfoSchemaColumnsTable::new())),
+            )
+            .expect("information_schema.columns virtual table creation should not fail"),
+        ),
+        Arc::new(
+            VirtualTable::new_internal(
+                "schemata".to_string(),
+                InfoSchemaSchemataTable::new().sql(),
+                VTabKind::VirtualTable,
+                Arc::new(RwLock::new(InfoSchemaSchemataTable::new())),
+            )
+            .expect("information_schema.schemata virtual table creation should not fail"),
+        ),
+        Arc::new(
+            VirtualTable::new_internal(
+                "routines".to_string(),
+                InfoSchemaRoutinesTable::new().sql(),
+                VTabKind::VirtualTable,
+                Arc::new(RwLock::new(InfoSchemaRoutinesTable::new())),
+            )
+            .expect("information_schema.routines virtual table creation should not fail"),
+        ),
+        Arc::new(
+            VirtualTable::new_internal(
+                "table_constraints".to_string(),
+                InfoSchemaTableConstraintsTable::new().sql(),
+                VTabKind::VirtualTable,
+                Arc::new(RwLock::new(InfoSchemaTableConstraintsTable::new())),
+            )
+            .expect("information_schema.table_constraints virtual table creation should not fail"),
         ),
     ]
 }
@@ -3270,6 +3345,226 @@ impl InternalVirtualTable for PgInputErrorInfoTable {
             };
         }
 
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 1.0,
+            estimated_rows: 1,
+            constraint_usages: usages,
+        })
+    }
+}
+
+/// Table-valued function: `pg_partition_ancestors(regclass)`
+///
+/// Returns the OIDs of the ancestor partitions of a partitioned table. Turso
+/// does not support table partitioning, so this always returns zero rows — which
+/// matches Postgres behavior for a non-partitioned table and lets psql's `\d`
+/// foreign-key introspection query (`... UNION ALL VALUES ('oid'::regclass)`)
+/// fall through to the VALUES clause.
+#[derive(Debug)]
+struct PgPartitionAncestorsTable;
+
+impl PgPartitionAncestorsTable {
+    fn new() -> Self {
+        Self
+    }
+}
+
+struct PgPartitionAncestorsCursor {
+    returned: bool,
+}
+
+impl PgPartitionAncestorsCursor {
+    fn new() -> Self {
+        Self { returned: false }
+    }
+}
+
+impl InternalVirtualTableCursor for PgPartitionAncestorsCursor {
+    fn next(&mut self) -> Result<bool, LimboError> {
+        // Always empty: no partition ancestors.
+        Ok(false)
+    }
+
+    fn rowid(&self) -> i64 {
+        0
+    }
+
+    fn column(&self, _column: usize) -> Result<Value, LimboError> {
+        Ok(Value::Null)
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        self.returned = false;
+        Ok(true)
+    }
+}
+
+impl InternalVirtualTable for PgPartitionAncestorsTable {
+    fn name(&self) -> String {
+        "pg_partition_ancestors".to_string()
+    }
+
+    fn sql(&self) -> String {
+        "CREATE TABLE pg_partition_ancestors (pg_partition_ancestors INTEGER, regclass TEXT HIDDEN)"
+            .to_string()
+    }
+
+    fn open(
+        &self,
+        _conn: Arc<Connection>,
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(PgPartitionAncestorsCursor::new())))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        let usages = constraints
+            .iter()
+            .map(|_| turso_ext::ConstraintUsage {
+                argv_index: None,
+                omit: false,
+            })
+            .collect();
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 1.0,
+            estimated_rows: 1,
+            constraint_usages: usages,
+        })
+    }
+}
+
+/// `unnest(array)` table-valued function.
+///
+/// Expands a single array column into one row per element. PostgreSQL's `unnest`
+/// is variadic and unnests multiple arrays in parallel (padding with NULL); this
+/// implementation covers the single-array form that psql's `\d+` reloptions line
+/// uses. The array arrives as the function's hidden argument as a `Value::Blob`
+/// holding the elements in the record format that the array code uses; we decode
+/// it with the public `ValueIterator`.
+#[derive(Debug)]
+struct UnnestTable;
+
+impl UnnestTable {
+    fn new() -> Self {
+        Self
+    }
+}
+
+struct UnnestCursor {
+    elements: Vec<Value>,
+    current: usize,
+}
+
+impl UnnestCursor {
+    fn new(elements: Vec<Value>) -> Self {
+        Self {
+            elements,
+            current: 0,
+        }
+    }
+}
+
+impl InternalVirtualTableCursor for UnnestCursor {
+    fn next(&mut self) -> Result<bool, LimboError> {
+        if self.current >= self.elements.len() {
+            return Ok(false);
+        }
+        self.current += 1;
+        Ok(self.current < self.elements.len())
+    }
+
+    fn rowid(&self) -> i64 {
+        self.current as i64
+    }
+
+    fn column(&self, _column: usize) -> Result<Value, LimboError> {
+        Ok(self
+            .elements
+            .get(self.current)
+            .cloned()
+            .unwrap_or(Value::Null))
+    }
+
+    fn filter(
+        &mut self,
+        args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        let array = args.first().cloned().unwrap_or(Value::Null);
+        self.elements = decode_array(&array);
+        self.current = 0;
+        Ok(true)
+    }
+}
+
+fn decode_array(array: &Value) -> Vec<Value> {
+    match array {
+        Value::Blob(blob) => turso_core::types::ValueIterator::new(blob)
+            .ok()
+            .map(|iter| {
+                iter.filter_map(|v| v.ok())
+                    .map(|r| r.to_owned().unwrap_or(Value::Null))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Value::Null => Vec::new(),
+        other => vec![other.clone()],
+    }
+}
+
+impl InternalVirtualTable for UnnestTable {
+    fn name(&self) -> String {
+        "unnest".to_string()
+    }
+
+    fn sql(&self) -> String {
+        "CREATE TABLE unnest (unnest TEXT, array TEXT HIDDEN)".to_string()
+    }
+
+    fn open(
+        &self,
+        _conn: Arc<Connection>,
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(UnnestCursor::new(Vec::new()))))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        // The array argument arrives as the HIDDEN column (index 1); bind it to
+        // argv 1 so the planner supplies it to the cursor's filter().
+        let mut usages = constraints
+            .iter()
+            .map(|_| turso_ext::ConstraintUsage {
+                argv_index: None,
+                omit: false,
+            })
+            .collect::<Vec<_>>();
+        for (i, c) in constraints.iter().enumerate() {
+            if c.column_index as usize == 1 && c.usable {
+                usages[i] = turso_ext::ConstraintUsage {
+                    argv_index: Some(1),
+                    omit: true,
+                };
+            }
+        }
         Ok(IndexInfo {
             idx_num: 0,
             idx_str: None,
@@ -4089,5 +4384,689 @@ mod tests {
                 _ => {}
             }
         }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// information_schema views (PostgreSQL-standard introspection surface)
+//
+// Exposed as virtual tables under their qualified names
+// (information_schema.<view>). Catalog name normalization preserves the
+// schema-qualifying dot, so `SELECT ... FROM information_schema.columns`
+// resolves. Source data is the live user schema, like pg_class/pg_attribute.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Map a SQLite type string to a PostgreSQL type name (for information_schema
+/// data_type / udt_name). Mirrors sqlite_type_to_pg_oid's base mapping.
+fn sqlite_type_to_pg_name(ty_str: &str) -> &'static str {
+    let base = match ty_str.find('(') {
+        Some(pos) => &ty_str[..pos],
+        None => ty_str,
+    };
+    match base.to_uppercase().as_str() {
+        "INTEGER" | "INT" | "INT4" => "integer",
+        "SMALLINT" | "INT2" => "smallint",
+        "BIGINT" | "INT8" => "bigint",
+        "TINYINT" | "MEDIUMINT" => "integer",
+        "TEXT" => "text",
+        "VARCHAR" | "CHAR" | "CLOB" | "NCHAR" | "NVARCHAR" | "CHARACTER VARYING" => {
+            "character varying"
+        }
+        "REAL" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT" | "FLOAT8" => "double precision",
+        "FLOAT4" => "real",
+        "BLOB" | "BYTEA" => "bytea",
+        "NUMERIC" | "DECIMAL" => "numeric",
+        "BOOLEAN" | "BOOL" => "boolean",
+        "UUID" => "uuid",
+        "JSON" => "json",
+        "JSONB" => "jsonb",
+        "DATE" => "date",
+        "TIME" => "time",
+        "TIMESTAMP" => "timestamp",
+        "TIMESTAMPTZ" => "timestamp with time zone",
+        "INET" => "inet",
+        "CIDR" => "cidr",
+        "MACADDR" => "macaddr",
+        "OID" => "oid",
+        _ => "text",
+    }
+}
+
+// ── information_schema.tables ──────────────────────────────────────────
+
+#[derive(Debug)]
+struct InfoSchemaTablesTable;
+
+impl InfoSchemaTablesTable {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl InternalVirtualTable for InfoSchemaTablesTable {
+    fn name(&self) -> String {
+        "information_schema.tables".to_string()
+    }
+
+    fn open(
+        &self,
+        conn: Arc<Connection>,
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(InfoSchemaTablesCursor::new(conn))))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        let constraint_usages = constraints
+            .iter()
+            .map(|_| turso_ext::ConstraintUsage {
+                argv_index: None,
+                omit: false,
+            })
+            .collect();
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 1000.0,
+            estimated_rows: 100,
+            constraint_usages,
+        })
+    }
+
+    fn sql(&self) -> String {
+        "CREATE TABLE information_schema.tables (
+            table_catalog TEXT,
+            table_schema TEXT,
+            table_name TEXT,
+            table_type TEXT,
+            self_referencing_column_name TEXT,
+            reference_generation TEXT,
+            user_defined_type_catalog TEXT,
+            user_defined_type_schema TEXT,
+            user_defined_type_name TEXT,
+            is_insertable_into TEXT,
+            is_typed TEXT,
+            commit_action TEXT
+        )"
+        .to_string()
+    }
+}
+
+struct InfoSchemaTablesCursor {
+    rows: Vec<Vec<Value>>,
+    current_row: usize,
+}
+
+impl InfoSchemaTablesCursor {
+    fn new(conn: Arc<Connection>) -> Self {
+        let mut cursor = Self {
+            rows: Vec::new(),
+            current_row: 0,
+        };
+        let schema = conn.current_schema();
+        for (table_name, _) in user_tables_sorted(&schema) {
+            cursor.rows.push(vec![
+                Value::Text("turso".into()),            // table_catalog
+                Value::Text("public".into()),           // table_schema
+                Value::Text(table_name.clone().into()), // table_name
+                Value::Text("BASE TABLE".into()),       // table_type
+                Value::Null,                            // self_referencing_column_name
+                Value::Null,                            // reference_generation
+                Value::Null,                            // user_defined_type_catalog
+                Value::Null,                            // user_defined_type_schema
+                Value::Null,                            // user_defined_type_name
+                Value::Text("YES".into()),              // is_insertable_into
+                Value::Text("NO".into()),               // is_typed
+                Value::Null,                            // commit_action
+            ]);
+        }
+        cursor
+    }
+}
+
+impl InternalVirtualTableCursor for InfoSchemaTablesCursor {
+    fn next(&mut self) -> Result<bool, LimboError> {
+        self.current_row += 1;
+        Ok(self.current_row < self.rows.len())
+    }
+    fn rowid(&self) -> i64 {
+        self.current_row as i64
+    }
+    fn column(&self, column: usize) -> Result<Value, LimboError> {
+        if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
+            Ok(self.rows[self.current_row][column].clone())
+        } else {
+            Ok(Value::Null)
+        }
+    }
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        self.current_row = 0;
+        Ok(!self.rows.is_empty())
+    }
+}
+
+// ── information_schema.columns ─────────────────────────────────────────
+
+#[derive(Debug)]
+struct InfoSchemaColumnsTable;
+
+impl InfoSchemaColumnsTable {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl InternalVirtualTable for InfoSchemaColumnsTable {
+    fn name(&self) -> String {
+        "information_schema.columns".to_string()
+    }
+
+    fn open(
+        &self,
+        conn: Arc<Connection>,
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(InfoSchemaColumnsCursor::new(conn))))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        let constraint_usages = constraints
+            .iter()
+            .map(|_| turso_ext::ConstraintUsage {
+                argv_index: None,
+                omit: false,
+            })
+            .collect();
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 1000.0,
+            estimated_rows: 1000,
+            constraint_usages,
+        })
+    }
+
+    fn sql(&self) -> String {
+        "CREATE TABLE information_schema.columns (
+            table_catalog TEXT,
+            table_schema TEXT,
+            table_name TEXT,
+            column_name TEXT,
+            ordinal_position INTEGER,
+            column_default TEXT,
+            is_nullable TEXT,
+            data_type TEXT,
+            character_maximum_length INTEGER,
+            character_octet_length INTEGER,
+            numeric_precision INTEGER,
+            numeric_scale INTEGER,
+            datetime_precision INTEGER,
+            character_set_name TEXT,
+            collation_name TEXT,
+            column_type TEXT,
+            udt_name TEXT
+        )"
+        .to_string()
+    }
+}
+
+struct InfoSchemaColumnsCursor {
+    rows: Vec<Vec<Value>>,
+    current_row: usize,
+}
+
+impl InfoSchemaColumnsCursor {
+    fn new(conn: Arc<Connection>) -> Self {
+        let mut cursor = Self {
+            rows: Vec::new(),
+            current_row: 0,
+        };
+        let schema = conn.current_schema();
+        for (table_name, table) in user_tables_sorted(&schema) {
+            for (i, col) in table.columns().iter().enumerate() {
+                let col_name = col.name.clone().unwrap_or_default();
+                let type_name = sqlite_type_to_pg_name(&col.ty_str);
+                let is_nullable = if col.notnull() { "NO" } else { "YES" };
+                let default = col
+                    .default
+                    .as_ref()
+                    .map(|d| d.to_string())
+                    .unwrap_or_default();
+                cursor.rows.push(vec![
+                    Value::Text("turso".into()),               // table_catalog
+                    Value::Text("public".into()),              // table_schema
+                    Value::Text(table_name.clone().into()),    // table_name
+                    Value::Text(col_name.into()),              // column_name
+                    Value::from_i64((i + 1) as i64),           // ordinal_position
+                    Value::Text(default.into()),               // column_default
+                    Value::Text(is_nullable.into()),           // is_nullable
+                    Value::Text(type_name.to_string().into()), // data_type
+                    Value::Null,                               // character_maximum_length
+                    Value::Null,                               // character_octet_length
+                    Value::Null,                               // numeric_precision
+                    Value::Null,                               // numeric_scale
+                    Value::Null,                               // datetime_precision
+                    Value::Null,                               // character_set_name
+                    Value::Null,                               // collation_name
+                    Value::Text(type_name.to_string().into()), // column_type
+                    Value::Text(type_name.to_string().into()), // udt_name
+                ]);
+            }
+        }
+        cursor
+    }
+}
+
+impl InternalVirtualTableCursor for InfoSchemaColumnsCursor {
+    fn next(&mut self) -> Result<bool, LimboError> {
+        self.current_row += 1;
+        Ok(self.current_row < self.rows.len())
+    }
+    fn rowid(&self) -> i64 {
+        self.current_row as i64
+    }
+    fn column(&self, column: usize) -> Result<Value, LimboError> {
+        if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
+            Ok(self.rows[self.current_row][column].clone())
+        } else {
+            Ok(Value::Null)
+        }
+    }
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        self.current_row = 0;
+        Ok(!self.rows.is_empty())
+    }
+}
+
+// ── information_schema.schemata ─────────────────────────────────────────
+
+#[derive(Debug)]
+struct InfoSchemaSchemataTable;
+
+impl InfoSchemaSchemataTable {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl InternalVirtualTable for InfoSchemaSchemataTable {
+    fn name(&self) -> String {
+        "information_schema.schemata".to_string()
+    }
+
+    fn open(
+        &self,
+        conn: Arc<Connection>,
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(InfoSchemaSchemataCursor::new(conn))))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        let constraint_usages = constraints
+            .iter()
+            .map(|_| turso_ext::ConstraintUsage {
+                argv_index: None,
+                omit: false,
+            })
+            .collect();
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 1000.0,
+            estimated_rows: 10,
+            constraint_usages,
+        })
+    }
+
+    fn sql(&self) -> String {
+        "CREATE TABLE information_schema.schemata (
+            catalog_name TEXT,
+            schema_name TEXT,
+            schema_owner TEXT,
+            default_character_set_catalog TEXT,
+            default_character_set_schema TEXT,
+            default_character_set_name TEXT,
+            sql_path TEXT
+        )"
+        .to_string()
+    }
+}
+
+struct InfoSchemaSchemataCursor {
+    rows: Vec<Vec<Value>>,
+    current_row: usize,
+}
+
+impl InfoSchemaSchemataCursor {
+    fn new(_conn: Arc<Connection>) -> Self {
+        let rows = vec![
+            vec![
+                Value::Text("turso".into()),
+                Value::Text("public".into()),
+                Value::Text("turso".into()),
+                Value::Null,
+                Value::Null,
+                Value::Text("UTF8".into()),
+                Value::Null,
+            ],
+            vec![
+                Value::Text("turso".into()),
+                Value::Text("information_schema".into()),
+                Value::Text("turso".into()),
+                Value::Null,
+                Value::Null,
+                Value::Text("UTF8".into()),
+                Value::Null,
+            ],
+            vec![
+                Value::Text("turso".into()),
+                Value::Text("pg_catalog".into()),
+                Value::Text("turso".into()),
+                Value::Null,
+                Value::Null,
+                Value::Text("UTF8".into()),
+                Value::Null,
+            ],
+        ];
+        Self {
+            rows,
+            current_row: 0,
+        }
+    }
+}
+
+impl InternalVirtualTableCursor for InfoSchemaSchemataCursor {
+    fn next(&mut self) -> Result<bool, LimboError> {
+        self.current_row += 1;
+        Ok(self.current_row < self.rows.len())
+    }
+    fn rowid(&self) -> i64 {
+        self.current_row as i64
+    }
+    fn column(&self, column: usize) -> Result<Value, LimboError> {
+        if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
+            Ok(self.rows[self.current_row][column].clone())
+        } else {
+            Ok(Value::Null)
+        }
+    }
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        self.current_row = 0;
+        Ok(!self.rows.is_empty())
+    }
+}
+
+// ── information_schema.routines ─────────────────────────────────────────
+// Reports the scalar functions this frontend resolves, so ORMs that probe
+// routine existence see them. Bodies are not stored (compat shim).
+
+#[derive(Debug)]
+struct InfoSchemaRoutinesTable;
+
+impl InfoSchemaRoutinesTable {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl InternalVirtualTable for InfoSchemaRoutinesTable {
+    fn name(&self) -> String {
+        "information_schema.routines".to_string()
+    }
+
+    fn open(
+        &self,
+        conn: Arc<Connection>,
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(InfoSchemaRoutinesCursor::new(conn))))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        let constraint_usages = constraints
+            .iter()
+            .map(|_| turso_ext::ConstraintUsage {
+                argv_index: None,
+                omit: false,
+            })
+            .collect();
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 1000.0,
+            estimated_rows: 100,
+            constraint_usages,
+        })
+    }
+
+    fn sql(&self) -> String {
+        "CREATE TABLE information_schema.routines (
+            routine_catalog TEXT,
+            routine_schema TEXT,
+            routine_name TEXT,
+            routine_type TEXT,
+            data_type TEXT,
+            specific_name TEXT
+        )"
+        .to_string()
+    }
+}
+
+struct InfoSchemaRoutinesCursor {
+    rows: Vec<Vec<Value>>,
+    current_row: usize,
+}
+
+impl InfoSchemaRoutinesCursor {
+    fn new(_conn: Arc<Connection>) -> Self {
+        // Derived from the shared function table so the view can never
+        // disagree with what `resolve_scalar` actually accepts.
+        let rows = crate::functions::SCALAR_FUNCTIONS
+            .iter()
+            .map(|name| {
+                vec![
+                    Value::Text("turso".into()),
+                    Value::Text("pg_catalog".into()),
+                    Value::Text((*name).into()),
+                    Value::Text("FUNCTION".into()),
+                    Value::Text("text".into()),
+                    Value::Text((*name).into()),
+                ]
+            })
+            .collect();
+        Self {
+            rows,
+            current_row: 0,
+        }
+    }
+}
+
+impl InternalVirtualTableCursor for InfoSchemaRoutinesCursor {
+    fn next(&mut self) -> Result<bool, LimboError> {
+        self.current_row += 1;
+        Ok(self.current_row < self.rows.len())
+    }
+    fn rowid(&self) -> i64 {
+        self.current_row as i64
+    }
+    fn column(&self, column: usize) -> Result<Value, LimboError> {
+        if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
+            Ok(self.rows[self.current_row][column].clone())
+        } else {
+            Ok(Value::Null)
+        }
+    }
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        self.current_row = 0;
+        Ok(!self.rows.is_empty())
+    }
+}
+
+// ── information_schema.table_constraints ───────────────────────────────
+// Reports the PRIMARY KEY constraint for each user table that actually has
+// one (compat shim; only PKs are modeled). Tables without a PK are omitted
+// rather than fabricated — ORMs inspect this view for migration strategy, and
+// lying about PK *presence* is worse than omitting the detail.
+
+#[derive(Debug)]
+struct InfoSchemaTableConstraintsTable;
+
+impl InfoSchemaTableConstraintsTable {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl InternalVirtualTable for InfoSchemaTableConstraintsTable {
+    fn name(&self) -> String {
+        "information_schema.table_constraints".to_string()
+    }
+
+    fn open(
+        &self,
+        conn: Arc<Connection>,
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(
+            InfoSchemaTableConstraintsCursor::new(conn),
+        )))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        let constraint_usages = constraints
+            .iter()
+            .map(|_| turso_ext::ConstraintUsage {
+                argv_index: None,
+                omit: false,
+            })
+            .collect();
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 1000.0,
+            estimated_rows: 100,
+            constraint_usages,
+        })
+    }
+
+    fn sql(&self) -> String {
+        "CREATE TABLE information_schema.table_constraints (
+            constraint_catalog TEXT,
+            constraint_schema TEXT,
+            constraint_name TEXT,
+            table_catalog TEXT,
+            table_schema TEXT,
+            table_name TEXT,
+            constraint_type TEXT,
+            is_deferrable TEXT,
+            initially_deferred TEXT,
+            enforced TEXT
+        )"
+        .to_string()
+    }
+}
+
+struct InfoSchemaTableConstraintsCursor {
+    rows: Vec<Vec<Value>>,
+    current_row: usize,
+}
+
+impl InfoSchemaTableConstraintsCursor {
+    fn new(conn: Arc<Connection>) -> Self {
+        let mut cursor = Self {
+            rows: Vec::new(),
+            current_row: 0,
+        };
+        let schema = conn.current_schema();
+        for (table_name, table) in user_tables_sorted(&schema) {
+            // Only report a PRIMARY KEY when the table actually has one. Tables
+            // without a PK must not be advertised as having one — ORMs inspect
+            // this view to decide migration strategy, and a fabricated PK is
+            // worse than an omitted detail.
+            let has_pk = table.columns().iter().any(|c| c.primary_key());
+            if !has_pk {
+                continue;
+            }
+            cursor.rows.push(vec![
+                Value::Text("turso".into()),
+                Value::Text("public".into()),
+                Value::Text(format!("{table_name}__pkey").into()),
+                Value::Text("turso".into()),
+                Value::Text("public".into()),
+                Value::Text(table_name.clone().into()),
+                Value::Text("PRIMARY KEY".into()),
+                Value::Text("NO".into()),
+                Value::Text("NO".into()),
+                Value::Text("YES".into()),
+            ]);
+        }
+        cursor
+    }
+}
+
+impl InternalVirtualTableCursor for InfoSchemaTableConstraintsCursor {
+    fn next(&mut self) -> Result<bool, LimboError> {
+        self.current_row += 1;
+        Ok(self.current_row < self.rows.len())
+    }
+    fn rowid(&self) -> i64 {
+        self.current_row as i64
+    }
+    fn column(&self, column: usize) -> Result<Value, LimboError> {
+        if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
+            Ok(self.rows[self.current_row][column].clone())
+        } else {
+            Ok(Value::Null)
+        }
+    }
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        self.current_row = 0;
+        Ok(!self.rows.is_empty())
     }
 }
