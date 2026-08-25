@@ -1655,6 +1655,27 @@ impl PostgreSQLTranslator {
             ));
         }
 
+        // VALUES clause as a compound leaf (e.g. `SELECT 1 UNION ALL VALUES (2)`):
+        // pg_query represents it as a SelectStmt with values_lists populated and an
+        // empty target_list. Translate it to OneSelect::Values so it composes with
+        // the surrounding set operation.
+        if !select.values_lists.is_empty() && select.target_list.is_empty() {
+            let mut rows = Vec::new();
+            for row_node in &select.values_lists {
+                let Some(pg_query::protobuf::node::Node::List(list)) = &row_node.node else {
+                    return Err(ParseError::ParseError(
+                        "VALUES: expected list node".to_string(),
+                    ));
+                };
+                let mut exprs = Vec::new();
+                for item in &list.items {
+                    exprs.push(Box::new(self.translate_expr(item)?));
+                }
+                rows.push(exprs);
+            }
+            return Ok(ast::OneSelect::Values(rows));
+        }
+
         let from_clause = if !select.from_clause.is_empty() {
             Some(self.translate_from_items(&select.from_clause)?)
         } else {
@@ -3497,8 +3518,8 @@ impl PostgreSQLTranslator {
         match sub_link.sub_link_type() {
             SubLinkType::ExistsSublink => Ok(ast::Expr::Exists(select)),
             SubLinkType::ExprSublink => Ok(ast::Expr::Subquery(select)),
+            SubLinkType::ArraySublink => self.translate_array_sublink(select),
             SubLinkType::AnySublink => {
-                // ANY/IN subquery: testexpr IN (SELECT ...)
                 let test_node = sub_link.testexpr.as_ref().ok_or_else(|| {
                     ParseError::ParseError("ANY SubLink missing testexpr".to_string())
                 })?;
@@ -3513,6 +3534,77 @@ impl PostgreSQLTranslator {
                 "Unsupported SubLink type: {other:?}",
             ))),
         }
+    }
+
+    /// Rewrite an `array(<subquery>)` ArraySublink into a scalar subquery that
+    /// aggregates the subquery's first column into an array:
+    /// `(SELECT array_agg(<col>) FROM <rest>)`.
+    ///
+    /// The core planner has no `array(subquery)` expression, but `array_agg`
+    /// over a scalar subquery already executes and yields an array stored in the
+    /// existing `Value::Blob` record format. This keeps the change confined to
+    /// the PostgreSQL translator — no core `Value`/`Expr` variants needed.
+    ///
+    /// PostgreSQL requires the subquery to return exactly one column; the rewrite
+    /// aggregates `*` if the subquery uses `SELECT *` (which collapses to the sole
+    /// column for a single-column source).
+    fn translate_array_sublink(&self, subquery: ast::Select) -> Result<ast::Expr, ParseError> {
+        // Element order and cardinality are part of `array(<subquery>)`'s
+        // result; dropping ORDER BY/LIMIT would silently change it. Reject
+        // rather than mis-evaluate.
+        if !subquery.order_by.is_empty() || subquery.limit.is_some() {
+            return Err(ParseError::ParseError(
+                "array(subquery) with ORDER BY or LIMIT is not supported".to_string(),
+            ));
+        }
+        let first_column = match &subquery.body {
+            ast::SelectBody {
+                select: ast::OneSelect::Select { columns, .. },
+                ..
+            } => match columns.first() {
+                Some(ast::ResultColumn::Expr(e, _)) => (**e).clone(),
+                _ => ast::Expr::Literal(ast::Literal::Numeric("1".to_string())),
+            },
+            _ => ast::Expr::Literal(ast::Literal::Numeric("1".to_string())),
+        };
+        let agg = ast::Expr::FunctionCall {
+            name: ast::Name::from_string("array_agg"),
+            distinctness: None,
+            args: vec![Box::new(first_column)],
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+        let mut inner = subquery;
+        let (from, where_clause) = match &mut inner.body {
+            ast::SelectBody {
+                select:
+                    ast::OneSelect::Select {
+                        from, where_clause, ..
+                    },
+                ..
+            } => (from.clone(), where_clause.clone()),
+            _ => (None, None),
+        };
+        Ok(ast::Expr::Subquery(ast::Select {
+            with: None,
+            body: ast::SelectBody {
+                select: ast::OneSelect::Select {
+                    distinctness: None,
+                    columns: vec![ast::ResultColumn::Expr(Box::new(agg), None)],
+                    from,
+                    where_clause,
+                    group_by: None,
+                    window_clause: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        }))
     }
 
     fn translate_with_clause(
@@ -4697,6 +4789,158 @@ pub fn is_comment_on(parse_result: &ParseResult) -> bool {
         return false;
     }
     matches!(&nodes[0].0, NodeRef::CommentStmt(_))
+}
+
+#[derive(Debug, Clone)]
+pub struct PgPrepareStmt {
+    pub name: String,
+    pub query: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PgExecuteStmt {
+    pub name: String,
+    pub params: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PgDeallocateStmt {
+    pub name: Option<String>,
+}
+
+pub fn try_extract_prepare(parse_result: &ParseResult) -> Option<PgPrepareStmt> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return None;
+    }
+    let prepare = match &nodes[0].0 {
+        NodeRef::PrepareStmt(p) => p,
+        _ => return None,
+    };
+    let query = prepare.query.as_ref()?.deparse().ok()?;
+    Some(PgPrepareStmt {
+        name: prepare.name.clone(),
+        query,
+    })
+}
+
+fn node_to_literal_string(node: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::protobuf::{a_const::Val, node::Node};
+    match &node.node {
+        Some(Node::Integer(i)) => Some(i.ival.to_string()),
+        Some(Node::Float(f)) => Some(f.fval.clone()),
+        Some(Node::String(s)) => Some(format!("'{}'", s.sval.replace('\'', "''"))),
+        Some(Node::AConst(a)) => {
+            if a.isnull {
+                return Some("NULL".to_string());
+            }
+            match a.val.as_ref()? {
+                Val::Ival(i) => Some(i.ival.to_string()),
+                Val::Fval(f) => Some(f.fval.clone()),
+                Val::Sval(s) => Some(format!("'{}'", s.sval.replace('\'', "''"))),
+                Val::Boolval(b) => Some(if b.boolval {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                }),
+                Val::Bsval(_) => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PgExplainStmt {
+    pub query: String,
+}
+
+pub fn try_extract_explain(
+    parse_result: &ParseResult,
+) -> Result<Option<PgExplainStmt>, ParseError> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return Ok(None);
+    }
+    let explain = match &nodes[0].0 {
+        NodeRef::ExplainStmt(e) => e,
+        _ => return Ok(None),
+    };
+    // PostgreSQL EXPLAIN options other than ANALYZE change the output format
+    // or instrumentation, none of which this frontend models. ANALYZE is
+    // accepted (both forms show the plan without executing). Reject the rest
+    // clearly instead of silently ignoring the option.
+    for opt in &explain.options {
+        if let Some(Node::DefElem(def)) = &opt.node {
+            if !def.defname.eq_ignore_ascii_case("analyze") {
+                return Err(ParseError::ParseError(format!(
+                    "EXPLAIN option {} is not supported",
+                    def.defname
+                )));
+            }
+        }
+    }
+    let query = explain
+        .query
+        .as_ref()
+        .ok_or_else(|| ParseError::ParseError("EXPLAIN missing statement".to_string()))?
+        .deparse()
+        .map_err(|e| ParseError::ParseError(format!("EXPLAIN deparse failed: {e}")))?;
+    Ok(Some(PgExplainStmt { query }))
+}
+
+pub fn try_extract_execute(
+    parse_result: &ParseResult,
+) -> Result<Option<PgExecuteStmt>, ParseError> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return Ok(None);
+    }
+    let execute = match &nodes[0].0 {
+        NodeRef::ExecuteStmt(e) => e,
+        _ => return Ok(None),
+    };
+    let params: Vec<Option<String>> = execute.params.iter().map(node_to_literal_string).collect();
+    // PostgreSQL only allows literal arguments in EXECUTE ... (params); a
+    // non-literal (e.g. `EXECUTE q(1 + 1)`) is a hard error, not a silently
+    // dropped parameter. Reject instead of binding the corresponding $N to
+    // NULL and returning wrong data.
+    if params.iter().any(|p| p.is_none()) {
+        return Err(ParseError::ParseError(
+            "EXECUTE parameters must be literal constants".to_string(),
+        ));
+    }
+    let params: Vec<String> = params.into_iter().map(Option::unwrap).collect();
+    Ok(Some(PgExecuteStmt {
+        name: execute.name.clone(),
+        params,
+    }))
+}
+
+pub fn try_extract_deallocate(parse_result: &ParseResult) -> Option<PgDeallocateStmt> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return None;
+    }
+    let deallocate = match &nodes[0].0 {
+        NodeRef::DeallocateStmt(d) => d,
+        _ => return None,
+    };
+    let name = if deallocate.isall {
+        None
+    } else {
+        Some(deallocate.name.clone())
+    };
+    Some(PgDeallocateStmt { name })
 }
 
 /// Extracted COPY FROM statement info for use by the connection layer.
